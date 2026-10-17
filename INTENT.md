@@ -116,7 +116,7 @@ An idempotent Bash installer script targeting Debian/Ubuntu hosts that:
 ## 5. Research & Verification Backlog
 Before building out the full Go daemon and installer scripts, we should research and validate the following technical details:
 
-1. **Optical Drive Detection & Polling in Docker (Linux `/dev/sr0` + `/dev/sg*`):**
+1. **Optical Drive Detection & Polling in Docker (Linux `/dev/sr0` + `/dev/sg*`) — See [`DRIVE.md`](DRIVE.md):**
    - Best non-intrusive way in Go/Linux to poll `/dev/sr0` for disc presence (`ioctl` `CDROM_DRIVE_STATUS` vs `blkid` / `/sys/class/block/sr0/events`) without repeatedly spinning up an empty drive or blocking when the tray is open.
    - Required Docker device mappings (`/dev/sr0` + `/dev/sg*`), group permissions (`cdrom`), and capabilities (`SYS_RAWIO` if needed for CSS key exchange).
 2. **`libdvdcss2` Installation in Debian/Ubuntu Docker Images:**
