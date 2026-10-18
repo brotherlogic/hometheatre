@@ -112,7 +112,7 @@ func QueryDriveStatus(devicePath string) (driveStatus int, discStatus int, err e
 - **Process User:** The container runs as `root`.
   - On Linux, granting `cap_add: [SYS_RAWIO]` in Docker Compose only populates the effective/permitted `CAP_SYS_RAWIO` capability automatically for `root` processes (non-root processes require `setcap` file capabilities on every child binary).
   - Running as `root` inside the isolated appliance container guarantees zero permission friction for `DVD_AUTH` ioctls, `SG_IO` SCSI pass-through commands, `blkid -p`, and `eject`.
-  - Optional `PUID` / `PGID` environment variables can be used to `chown` output `.iso` and `.nfo` files written to the NFS share if required by the NAS.
+  - Per [`DOCKER.md`](DOCKER.md), `PUID` / `PGID` environment variables are applied via thread-scoped `unix.Setfsuid(puid)` / `unix.Setfsgid(pgid)` (`WithNFSUser`) whenever creating or writing `.iso`, `.nfo`, and `.probe.json` files on `/mnt/nfs`, ensuring compatibility with `root_squash` NAS exports while the daemon process runs as `root`.
 - **Group & Capabilities in `docker-compose.yml`:**
   ```yaml
   group_add:

@@ -170,6 +170,16 @@ A `MOVIE` disc is automatically filed to `<NFS_ROOT>/movies/Movie Title (Year)/`
 4. **Unambiguous Match (No Competing Remake):** Exactly **one** candidate satisfies both the normalized title match and the $\pm 15$-minute runtime check (or `HintYear` from the volume label explicitly disambiguates the release year within $\pm 1$ year).
    - If two movies with the same title (e.g., an original and a remake of similar length) both match and no year is in the volume label, the daemon routes the disc to `/unidentified` with both candidates pre-populated for 1-click selection in the Web UI.
 
+### 3.4 TMDB Authentication (v3 API Key & v4 Bearer Token) & Offline Fallback
+1. **Automatic Dual-Format Authentication (`TMDB_API_KEY`):**
+   - Users copying credentials from their TMDB account settings may paste either a **v3 API Key** (32-character hex string) or a **v4 API Read Access Token** (JWT starting with `eyJ...`).
+   - Both `install.sh` (during pre-flight validation against `https://api.themoviedb.org/3/configuration`) and the Go TMDB client automatically detect the format:
+     - If `TMDB_API_KEY` starts with `eyJ` (or length `> 64`), authenticate via header `Authorization: Bearer <TMDB_API_KEY>`.
+     - Otherwise, pass the key as query parameter `?api_key=<TMDB_API_KEY>`.
+2. **Offline / API Failure Fallback:**
+   - If TMDB API requests fail (DNS resolution error, network timeout, HTTP `429` rate limit, or `5xx` error) after 3 brief retries (`1s`, `2s`, `4s` backoff) during background matching, the daemon **never fails or discards the rip**.
+   - Instead, it moves the `.iso` and writes `.probe.json` to `<NFS_ROOT>/unidentified/` with `"reason": "tmdb_lookup_error"` so the backup is safely stored on the NAS and can be searched and tagged in the Web UI once connectivity is restored.
+
 ---
 
 ## 4. `/unidentified` Queue Persistence (`.probe.json` Sidecar)
@@ -338,3 +348,41 @@ Kodi's TV library scanner requires two levels of metadata to index multi-episode
   <thumb>https://image.tmdb.org/t/p/original/8yX9R2vM3kL4pQ1nZ7cT5bW2vXy.jpg</thumb>
 </episodedetails>
 ```
+
+### 5.4 Multi-Disc Movies, Extras & Collision Resolution in Web UI
+When a user inserts a second disc for an already-filed movie (e.g., Disc 2 / Bonus Features of a 2-Disc Special Edition, or an alternate cut) and [`DOCKER.md` Section 4.2](DOCKER.md) routes the `.iso` to `/unidentified` with `"reason": "target_already_exists"`, the Web UI tagging modal provides three resolution options:
+1. **Save with Edition / Disc Suffix (Default for Multi-Disc Sets):**
+   - Allows entering an optional label such as `Disc 2`, `Bonus Features`, or `Director's Cut`, filing the `.iso` and companion `.nfo` alongside the main feature:
+     ```text
+     <NFS_ROOT>/movies/Movie Title (Year)/
+       ├── Movie Title (Year).iso
+       ├── Movie Title (Year).nfo
+       ├── Movie Title (Year) - Disc 2.iso
+       └── Movie Title (Year) - Disc 2.nfo
+     ```
+   - The companion `.nfo` sets `<title>Movie Title (Disc 2)</title>` so Kodi displays both discs clearly in the library.
+2. **Replace Existing `.iso`:**
+   - Atomically overwrites `Movie Title (Year).iso` and `.nfo` (useful when intentionally re-ripping a cleaner copy of a movie).
+3. **Delete Unidentified `.iso`:**
+   - Removes the duplicate `.iso` and `.probe.json` from `/unidentified`.
+
+### 5.5 Rip History Persistence & Webhook Payload Schema
+1. **Persistent Rip History (`<SCRATCH_DIR>/history.json`):**
+   - The Go daemon persists the most recent 100 completed/failed rip records in `/scratch/history.json` (updated atomically via `history.json.tmp` + `os.Rename`) so the Web UI history table survives container restarts.
+2. **Webhook Notification Schema (`WEBHOOK_URL`):**
+   - When `WEBHOOK_URL` is non-empty, the daemon sends an asynchronous `HTTP POST` (`Content-Type: application/json`, `10s` timeout) on `rip_completed`, `rip_unidentified`, and `rip_failed`.
+   - The JSON body includes both structured metadata fields and top-level `text` and `content` summary strings so it works out-of-the-box with Slack, Discord, Mattermost, Home Assistant, and generic webhook endpoints:
+     ```json
+     {
+       "event": "rip_unidentified",
+       "text": "[HomeTheatre] Disc needs tagging: OFFICE_S2_D1 (TV_SERIES, 6 episodes detected)",
+       "content": "[HomeTheatre] Disc needs tagging: OFFICE_S2_D1 (TV_SERIES, 6 episodes detected)",
+       "timestamp": "2026-10-18T15:30:00Z",
+       "raw_label": "OFFICE_S2_D1",
+       "classification": "TV_SERIES",
+       "stage": "stage1_dvdbackup",
+       "iso_path": "/mnt/nfs/unidentified/OFFICE_S2_D1_20261018T153000Z.iso",
+       "reason": "tv_series_requires_episode_confirmation"
+     }
+     ```
+

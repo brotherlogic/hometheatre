@@ -3,8 +3,8 @@
 ## 1. Project Vision & Goal
 Build a zero-touch, appliance-like DVD backup pipeline running in Docker on a Linux host (`Debian`/`Ubuntu`):
 1. **Drop a DVD into the physical drive** and walk away.
-2. The container automatically detects the disc, decrypts it, rips a **full 1:1 DVD `.iso` backup** (preserving original DVD menus, special features, audio tracks, and subtitles) to local scratch storage, and **immediately auto-ejects the physical disc** so the next DVD can be inserted right away.
-3. In the background, the service builds/finalizes the `.iso`, identifies the Movie or TV Series (using DVD volume label, `lsdvd` track durations, and the **TMDB API**), generates a companion **Kodi `.nfo` metadata file**, and moves the result to an **existing NAS NFS share**.
+2. The container automatically detects the disc, decrypts it, rips and finalizes a **full 1:1 DVD `.iso` backup** (preserving original DVD menus, special features, audio tracks, and subtitles) on local scratch storage, and **immediately auto-ejects the physical disc** so the next DVD can be inserted right away.
+3. In the background, the service identifies the Movie or TV Series (using DVD volume label, `lsdvd` track durations, and the **TMDB API**), generates a companion **Kodi `.nfo` metadata file**, and moves the `.iso` and `.nfo` to an **existing NAS NFS share**.
 4. **Kodi** clients running independently on **Google TV** and a **tablet** read directly from the NAS NFS share over the network—playing full DVD ISOs with original menus and 100% accurate library metadata without needing a middleman media server.
 
 ---
@@ -36,9 +36,9 @@ flowchart TD
 - **Runtime:** Docker & Docker Compose (`restart: unless-stopped`).
 - **Drive Detection:** In-container polling loop monitoring `/dev/sr0` state changes (avoids fragile host-level `udev` triggers calling `docker exec` and keeps live drive status visible in the Web UI).
 
-### 3.2 Storage & Staging Strategy — See [`DOCKER.md`](DOCKER.md)
-- **Local Scratch Disk (`SCRATCH_DIR`):** Requires ~20 GB of free local disk space on the container host.
-  - Ripping and building the `.iso` on local disk first avoids network bottlenecks/stalls during optical reads, ensures Stage 2 (`ddrescue`) fallback can still access the physical disc if `genisoimage -dvd-video` rejects protected `.IFO` tables, and allows the physical DVD tray to **eject immediately** once the local `.iso` is finalized—while TMDB matching and the multi-gigabyte NFS file transfer continue asynchronously in the background.
+### 3.2 Storage & Staging Strategy — See [`DOCKER.md`](DOCKER.md) & [`RIPPING.md`](RIPPING.md)
+- **Local Scratch Disk (`SCRATCH_DIR`):** Requires **`>= 25 GiB`** of free local disk space on the container host (`30+ GiB` recommended for back-to-back dual-layer ripping), enforced by both `install.sh` and a runtime `unix.Statfs` space gate (`>= 18 GiB` free before starting a new rip).
+  - Ripping and building the `.iso` on local disk first avoids network bottlenecks/stalls during optical reads, ensures Stage 2 (`ddrescue`) fallback can still access the physical disc if `genisoimage -dvd-video` rejects protected `.IFO` tables, persists job state in `<job_dir>/job.json` for crash recovery across container restarts, and allows the physical DVD tray to **eject immediately** once the local `.iso` is finalized—while TMDB matching and the multi-gigabyte NFS file transfer continue asynchronously in the background.
 - **NAS NFS Mount:** Mounted directly by Docker Compose using the local `nfs` volume driver (`addr=${NFS_SERVER_IP},${NFS_OPTS}`), with `install.sh` auto-probing `nfsvers=4` (falling back to `nfsvers=3,nolock`), auto-detecting share `PUID`/`PGID` for `root_squash` compatibility (applied via thread-scoped `Setfsuid`/`Setfsgid` in Go), and staging transfers to hidden `.iso.partial` files with `fsync` + atomic `os.Rename`.
 
 ### 3.3 DVD Ripping Engine (100% Open-Source, Two-Stage Pipeline)
@@ -53,7 +53,7 @@ flowchart TD
 - **Heuristics + TMDB Lookup:**
   - Extracts raw volume label (`blkid` primary, `lsdvd -Ox` fallback) and title durations (`lsdvd -Ox` XML, re-probing the finalized local `.iso` if the initial `/dev/sr0` probe failed).
   - Filters out composite `"Play All"` tracks and deduplicates identical-duration logical PGCs (`Δ < 0.1s`) to classify **Movie** (`60–240m` feature track) vs. **TV Series** ($N \ge 2$ clustered `18–65m` episode tracks).
-  - Auto-files high-confidence **Movies** (non-generic label + exact normalized TMDB title match + DVD feature duration within `±15m` of TMDB runtime); routes **TV Series** discs and ambiguous/cryptic discs to `/unidentified` with a `.probe.json` sidecar containing pre-populated TMDB candidates and suggested episode counts for 1-click Web UI confirmation.
+  - Supports both TMDB v3 API Keys (`?api_key=`) and v4 Read Access Tokens (`Authorization: Bearer`). Auto-files high-confidence **Movies** (non-generic label + exact normalized TMDB title match + DVD feature duration within `±15m` of TMDB runtime); routes **TV Series** discs, multi-disc collisions, offline lookups, and ambiguous/cryptic discs to `/unidentified` with a `.probe.json` sidecar containing pre-populated TMDB candidates and suggested episode counts for 1-click Web UI confirmation.
 - **Kodi NFS Directory Layout & Naming Conventions:**
   - **Movies:**
     ```text
@@ -67,8 +67,8 @@ flowchart TD
     <NFS_ROOT>/tv/Show Title (Year)/
       ├── tvshow.nfo
       └── Season 01/
-          ├── Show Title - S01E01E02E03E04.iso
-          └── Show Title - S01E01E02E03E04.nfo
+        ├── Show Title - S01E01E02E03E04.iso
+        └── Show Title - S01E01E02E03E04.nfo
     ```
   - **Unidentified / Needs Confirmation Queue:**
     ```text
@@ -83,18 +83,18 @@ flowchart TD
 - **Language:** **Go (Golang)** compiled via a multi-stage Dockerfile into a single static binary.
 - **Responsibilities of the Go Daemon:**
   1. Poll `/dev/sr0` for disc insertion and drive readiness.
-  2. Orchestrate the two-stage ripping CLI tools (`blkid`, `lsdvd`, `dvdbackup`, `genisoimage`, `ddrescue`, `eject`).
-  3. Manage concurrent worker queues (Drive Reader queue vs. Background ISO Build + NFS Transfer queue).
+  2. Orchestrate the two-stage ripping CLI tools (`blkid`, `lsdvd`, `dvdbackup`, `genisoimage`, `ddrescue`, `eject`) with runtime scratch space gating and `job.json` crash recovery.
+  3. Manage concurrent worker queues (Drive Reader & Local ISO Finalizer queue vs. Background TMDB + NFS Transfer queue).
   4. Query TMDB REST API and generate Kodi `.nfo` XML files.
   5. Serve a lightweight embedded **Web UI** (`net/http` + `html/template`) showing:
      - Live optical drive & background queue status
-     - Recent rip history & logs
-     - **"Unidentified / Needs Tagging" queue**: lets the user search TMDB, select Movie vs. TV Show (with Season + starting/ending episode numbers auto-suggested from `lsdvd` track count), and move/rename the `.iso` + generate the `.nfo` on the NFS share with one click.
+     - Recent rip history & logs (persisted in `<SCRATCH_DIR>/history.json`)
+     - **"Unidentified / Needs Tagging" queue**: lets the user search TMDB, select Movie (with optional Disc/Edition suffix for multi-disc sets) vs. TV Show (with Season + starting/ending episode numbers auto-suggested from `lsdvd` track count), and move/rename the `.iso` + generate the `.nfo` on the NFS share with one click.
   6. Send an optional webhook notification (`WEBHOOK_URL` in `.env`) on rip completion, error, or when manual tagging is needed.
 
 ### 3.6 Playback Clients (Kodi)
 - **Independent Clients:** Standalone Kodi apps on Google TV and tablet (no central MariaDB server required).
-- **Network Protocol:** Kodi reads directly from the NAS NFS share (`nfs://<NFS_SERVER>/<NFS_PATH>/movies` and `/tv`).
+- **Network Protocol:** Kodi reads directly from the NAS NFS share (`nfs://<NFS_SERVER>/<NFS_PATH>/movies` and `/tv`; NAS export must allow unprivileged ports via `insecure` for Kodi's userspace `libnfs` client on Android/Google TV).
 
 ---
 
@@ -102,42 +102,40 @@ flowchart TD
 
 ### 4.1 Installer Script (`install.sh`)
 An idempotent Bash installer script targeting Debian/Ubuntu hosts that:
-1. Checks and installs host prerequisites (`docker.io` / `docker-ce`, `docker-compose-plugin`, `nfs-common`, `lsscsi`, `udev`).
-2. Detects attached optical drives (`/dev/sr*` and corresponding generic SCSI `/dev/sg*` devices) and verifies device permissions.
+1. Checks and installs host prerequisites (`docker.io` / `docker-ce`, `docker-compose-plugin`, `nfs-common`, `dnsutils`, `util-linux`, `lsscsi`, `udev`, `curl`).
+2. Loads and persists the `sg` kernel module (`modprobe sg` + `/etc/modules-load.d/hometheatre-sg.conf`), detects attached optical drives (`/dev/sr*` and corresponding generic SCSI `/dev/sg*` devices via `sysfs`), and verifies device permissions.
 3. Prompts for (or reads from `.env`) configuration values:
-   - `NFS_SERVER` and `NFS_PATH` (and tests mounting/reachability from the host)
-   - `TMDB_API_KEY` (validates against TMDB API)
-   - `SCRATCH_DIR` (verifies at least ~20 GB free local disk space)
+   - `NFS_SERVER` and `NFS_PATH` (resolves `NFS_SERVER_IP`, auto-probes `nfsvers=4` vs `nfsvers=3,nolock`, auto-detects `PUID`/`PGID`, and tests write access via `setpriv`)
+   - `TMDB_API_KEY` (validates v3 API key or v4 Bearer token against TMDB API)
+   - `SCRATCH_DIR` (verifies at least **`25 GiB`** free local disk space)
    - `WEB_PORT` (default e.g. `8080`)
    - `WEBHOOK_URL` (optional)
 4. Initializes the required folder structure on the NFS share (`movies/`, `tv/`, `unidentified/`).
-5. Builds and starts the Docker Compose stack (`docker compose up -d --build`).
-6. Outputs a summary with the local Web UI URL and exact NFS paths to enter into Kodi on Google TV and the tablet.
+5. Recreates the `hometheatre_nfs_media` Docker volume wrapper if NFS mount options changed, then builds and starts the Docker Compose stack (`docker compose up -d --build`).
+6. Outputs a summary with the local Web UI URL and exact NFS paths (plus `insecure` export reminder) to enter into Kodi on Google TV and the tablet.
 
 ---
 
-## 5. Research & Verification Backlog
-Before building out the full Go daemon and installer scripts, we should research and validate the following technical details:
+## 5. Research & Verification Backlog (Completed)
+All technical specifications for Phase 1 have been verified and documented:
 
 1. **Optical Drive Detection & Polling in Docker (Linux `/dev/sr0` + `/dev/sg*`) — See [`DRIVE.md`](DRIVE.md):**
-   - Best non-intrusive way in Go/Linux to poll `/dev/sr0` for disc presence (`ioctl` `CDROM_DRIVE_STATUS` vs `blkid` / `/sys/class/block/sr0/events`) without repeatedly spinning up an empty drive or blocking when the tray is open.
-   - Required Docker device mappings (`/dev/sr0` + `/dev/sg*`), group permissions (`cdrom`), and capabilities (`SYS_RAWIO` if needed for CSS key exchange).
+   - Non-intrusive polling via `ioctl(CDROM_DRIVE_STATUS)` with `O_RDONLY | O_NONBLOCK`, single-trigger insertion latch, Docker device mappings (`/dev/sr0` + `/dev/sg*`), `cdrom` GID, `CAP_SYS_RAWIO`, and `sysfs` drive discovery with `sg` module persistence.
 2. **`libdvdcss2` Installation in Debian/Ubuntu Docker Images — See [`RIPPING.md`](RIPPING.md):**
-   - Clean, non-interactive installation of `libdvdcss2` inside a multi-stage Dockerfile (compiling `libdvdcss2_*.deb` via Debian `contrib` `libdvd-pkg` in an intermediate builder stage and installing only the `.deb` in `debian:bookworm-slim`).
-3. **Two-Stage Rip Commands & Flags (`dvdbackup`, `genisoimage`, `ddrescue`) — See [`RIPPING.md`](RIPPING.md):**
-   - Exact CLI flags for Stage 1 (`dvdbackup -M -r a -n dvd` + `genisoimage -quiet -dvd-video -V <LABEL_32>`) prior to ejecting so `.IFO` layout errors can still fall back to Stage 2.
-   - Stage 2 `ddrescue` flags (`-b 2048 -n -N -K 64Ki,1Mi -O -T 2m`) after re-unlocking CSS bus keys via `lsdvd -x /dev/sr0`, plus `>= 95%` rescued mapfile validation.
+   - Clean, non-interactive compilation of `libdvdcss2_*.deb` via Debian `contrib` `libdvd-pkg` in an intermediate builder stage (`dvdcss-builder`) and installation of only the `.deb` in `debian:bookworm-slim`.
+3. **Two-Stage Rip Commands, Scratch Space Gate & Crash Recovery (`dvdbackup`, `genisoimage`, `ddrescue`) — See [`RIPPING.md`](RIPPING.md):**
+   - Stage 1 (`dvdbackup -M -r a -n dvd` + `genisoimage -quiet -dvd-video -V <LABEL_32>`) prior to ejecting so `.IFO` layout errors can still fall back to Stage 2; Stage 2 `ddrescue` (`-b 2048 -n -N -K 64Ki,1Mi -O -T 2m`) after re-unlocking CSS bus keys via `lsdvd -x /dev/sr0`, `>= 95%` rescued mapfile validation, `>= 18 GiB` runtime `Statfs` gate, and `<job_dir>/job.json` crash recovery.
 4. **DVD Volume Label & `lsdvd` Parsing Heuristics — See [`METADATA.md`](METADATA.md):**
-   - Parsing `lsdvd -Ox` (XML in `lsdvd 0.17`, with bare `&` / UTF-8 sanitization in Go), filtering composite `"Play All"` tracks and duplicate logical PGCs (`Δ < 0.1s`), classifying Movies vs. TV Series discs, sanitizing raw DVD volume labels, and persisting `.probe.json` sidecars in `/unidentified`.
-5. **Kodi `.nfo` Specification for Movie & Multi-Episode TV ISOs — See [`METADATA.md`](METADATA.md):**
-   - Full Kodi `.nfo` XML schemas populated from TMDB for standalone movies (`<movie>`), TV series root directories (`tvshow.nfo` `<tvshow>`), and multi-episode TV `.iso` files (concatenated root-level `<episodedetails>` blocks with `<uniqueid type="tmdb" default="true">`).
+   - Parsing `lsdvd -Ox` (XML in `lsdvd 0.17`, with bare `&` / UTF-8 sanitization in Go), filtering composite `"Play All"` tracks and duplicate logical PGCs (`Δ < 0.1s`), classifying Movies vs. TV Series discs, dual v3/v4 TMDB auth, offline fallback, and persisting `.probe.json` sidecars in `/unidentified`.
+5. **Kodi `.nfo` Specification, Multi-Disc Handling & Webhooks — See [`METADATA.md`](METADATA.md):**
+   - Full Kodi `.nfo` XML schemas populated from TMDB for standalone movies (`<movie>`), multi-disc movie suffix resolution (`Disc 2` / `Bonus Features`), TV series root directories (`tvshow.nfo` `<tvshow>`), multi-episode TV `.iso` files (concatenated root-level `<episodedetails>` blocks), `<SCRATCH_DIR>/history.json` persistence, and `WEBHOOK_URL` JSON payload format.
 6. **Docker Compose NFS Volume Driver Behavior — See [`DOCKER.md`](DOCKER.md):**
-   - Auto-negotiated `nfsvers=4` (fallback `nfsvers=3,nolock`) with `rw,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime`, IP resolution for `addr=`, `install.sh` pre-flight write/ownership testing (`PUID`/`PGID` + `Setfsuid`/`Setfsgid` for `root_squash`), Docker volume recreation on config changes, and atomic `.iso.partial` + `fsync` + `os.Rename` transfer staging.
+   - Auto-negotiated `nfsvers=4` (fallback `nfsvers=3,nolock`) with `rw,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime`, IP resolution for `addr=`, `install.sh` pre-flight write/ownership testing (`PUID`/`PGID` + `Setfsuid`/`Setfsgid` for `root_squash`), Kodi `libnfs` `insecure` port requirement, Docker volume recreation on config changes, and atomic `.iso.partial` + `fsync` + `os.Rename` transfer staging.
 
 ---
 
 ## 6. Implementation Roadmap
-1. **Phase 1 — Research & Technical Spike:** Investigate and document findings for the 6 research items above (CLI flags, `ioctl`/polling, Kodi `.nfo` format, Docker NFS volume config).
+1. **Phase 1 — Research & Technical Spike (Completed):** Documented in [`DRIVE.md`](DRIVE.md), [`RIPPING.md`](RIPPING.md), [`METADATA.md`](METADATA.md), and [`DOCKER.md`](DOCKER.md).
 2. **Phase 2 — Installer & Infrastructure (`install.sh` + `Dockerfile` + `docker-compose.yml`):** Build the idempotent Debian/Ubuntu host installer script, `.env.example`, and container image with `libdvdcss2`, `dvdbackup`, `genisoimage`, `gddrescue`, and `lsdvd`.
-3. **Phase 3 — Go Ripping & Identification Daemon:** Implement the drive poller, two-stage ripper (`dvdbackup` -> eject -> `genisoimage` / `ddrescue` fallback), `lsdvd` + TMDB matcher, and Kodi `.nfo` writer.
-4. **Phase 4 — Embedded Web UI & Kodi Onboarding Guide:** Add the local web dashboard for live status and one-click tagging of unidentified/TV discs, plus a quick-start guide for pointing Kodi on Google TV and tablets at the NFS share.
+3. **Phase 3 — Go Ripping & Identification Daemon:** Implement the drive poller, two-stage ripper (`dvdbackup` + `genisoimage` -> `eject`, or `ddrescue` fallback -> `eject`), `job.json` crash recovery, `lsdvd` + TMDB matcher, and atomic NFS + Kodi `.nfo` writer.
+4. **Phase 4 — Embedded Web UI & Kodi Onboarding Guide:** Add the local web dashboard for live status, `history.json`, webhook notifications, and one-click tagging of unidentified/TV/multi-disc ISOs, plus a quick-start guide for pointing Kodi on Google TV and tablets at the NFS share.

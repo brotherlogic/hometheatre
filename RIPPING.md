@@ -184,3 +184,37 @@ Because `ddrescue` exits with status `0` after completing its copying pass even 
      - The daemon deletes `<job_dir>/disc.iso` and `<job_dir>/ddrescue.map` from local scratch so broken partial images never pollute the NAS NFS share.
      - Runs `eject /dev/sr0`.
      - Records the failed rip in the Web UI history (including stage, `rescuedRatio`, and stderr tail) and sends a failure notification to `WEBHOOK_URL` if configured.
+
+---
+
+## 5. Scratch Disk Capacity Gate & Crash Recovery (`/scratch/job_<id>`)
+
+### 5.1 Peak Scratch Usage & Pre-Rip Free Space Gate (`>= 18 GiB`)
+- During Stage 1B (`genisoimage`), both the mirrored `VIDEO_TS` directory (`<job_dir>/dvd`, up to `8.5 GB` for a dual-layer `DVD-9`) and the output `<job_dir>/disc.iso` (up to `8.5 GB`) coexist briefly on `<SCRATCH_DIR>` for ~20–45 seconds, requiring up to **~17 GB** of peak local disk space for a single disc.
+- If a user inserts a new DVD while a previous `8.5 GB` `.iso` is still transferring over the network to the NAS (or waiting in NFS retry backoff), peak scratch usage reaches **~25.5 GB**.
+- To prevent mid-rip `ENOSPC` failures:
+  1. **Host Pre-Flight (`install.sh`):** Verifies that `SCRATCH_DIR` has at least **`25 GiB`** (`26,843,545,600` bytes) of free space (recommending `30+ GiB` for back-to-back dual-layer ripping).
+  2. **Runtime Space Gate (`unix.Statfs`):** Before starting Stage 1 (`dvdbackup`) on a newly inserted disc, the Go daemon checks `Bavail * Bsize` on `/scratch`.
+     - If available space is **`< 18 GiB`** and an in-flight or queued NFS transfer is currently holding a finalized `.iso` in `/scratch`, the rip worker pauses in `Waiting for Scratch Space` state until the NFS transfer completes and deletes the previous scratch `.iso`.
+     - If available space remains `< 18 GiB` with no pending transfers that can free space, the daemon aborts before ripping, logs an `insufficient_scratch_space` error, sends a webhook alert, and ejects the disc.
+
+### 5.2 Container Restart & Crash Recovery (`job.json`)
+To ensure orphaned files never accumulate on `/scratch` and finalized local `.iso` rips are never lost if the container restarts before the NAS transfer completes:
+1. **Job State File (`<job_dir>/job.json`):**
+   - When a rip begins in `/scratch/job_<id>`, the daemon writes `/scratch/job_<id>/job.json`:
+     ```json
+     {
+       "job_id": "job_20261018T153000Z",
+       "started_at": "2026-10-18T15:30:00Z",
+       "state": "ripping",
+       "stage": "stage1_dvdbackup",
+       "raw_label": "THE_MATRIX_16X9",
+       "tracks_seconds": [8160.2]
+     }
+     ```
+   - Immediately after `<job_dir>/disc.iso` passes validation (and before `eject /dev/sr0`), the daemon updates `job.json` to `"state": "iso_finalized"` and `fsync`s it.
+2. **Startup Reconciliation:**
+   - When the Go daemon starts up, it scans `/scratch/job_*`:
+     - **Interrupted Rip (`state != "iso_finalized"` or missing/invalid `disc.iso`):** Immediately deletes `/scratch/job_<id>` to reclaim gigabytes from interrupted `dvdbackup` or `ddrescue` runs.
+     - **Finalized Rip Pending Transfer (`state == "iso_finalized"` with valid `disc.iso`):** Automatically re-enqueues the job into the background TMDB + NFS transfer worker.
+

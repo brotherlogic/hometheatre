@@ -71,7 +71,7 @@ NFS_OPTS=rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noati
 PUID=1000
 PGID=1000
 
-# Local Scratch Storage (>= 20 GiB free space required)
+# Local Scratch Storage (>= 25 GiB free space required)
 SCRATCH_DIR=/var/lib/hometheatre/scratch
 
 # Metadata & Web UI
@@ -106,6 +106,12 @@ Because Docker's `local` volume driver passes `driver_opts.o` directly to the mo
    rw,nfsvers=3,nolock,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime
    ```
    Used automatically if the NAS share is exported exclusively for NFSv3 (common on older NAS setups configured specifically for Kodi's built-in `libnfs` client). `nolock` is included for NFSv3 so file locks remain local to the single writer container without requiring `rpc.statd`/`lockd` firewall ports on the host or NAS.
+
+### 2.3 NAS Export Requirement for Standalone Kodi Clients on Google TV & Tablets (`insecure` / Non-Root Ports)
+While the Linux Docker host mounts the NAS export using the in-kernel NFS client (which binds privileged source ports `< 1024`), standalone **Kodi apps on Google TV and Android tablets** use Kodi's built-in userspace `libnfs` library, which runs as an unprivileged Android app and connects from unprivileged source ports (`> 1024`).
+- On Linux `nfs-kernel-server`, TrueNAS, and Unraid, the NAS NFS export **must include the `insecure` option** (allowing NFS requests from ports `> 1024`), and on Synology/QNAP, default non-privileged port access must remain enabled.
+- Without `insecure` on the NAS export, the Docker container on the Linux host will mount and write to the NFS share cleanly, **but Kodi on Google TV/tablets will receive `Permission Denied` when browsing `nfs://<NFS_SERVER>/<NFS_PATH>`**.
+- `install.sh` explicitly highlights this requirement in its final Kodi onboarding summary.
 
 ---
 
