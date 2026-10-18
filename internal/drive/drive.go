@@ -86,6 +86,42 @@ func DriveStatusString(driveStatus int) string {
 // StatusQueryFunc queries the optical drive status for a device path.
 type StatusQueryFunc func(devicePath string) (driveStatus int, discStatus int, err error)
 
+// WaitForDiscReady polls queryFn (defaulting to QueryDriveStatus) until the drive
+// reports CDROM_DRIVE_STATUS == CDS_DISC_OK, or until timeout elapses / ctx is canceled.
+func WaitForDiscReady(ctx context.Context, devicePath string, queryFn StatusQueryFunc, timeout, pollInterval time.Duration) (int, error) {
+	if queryFn == nil {
+		queryFn = QueryDriveStatus
+	}
+	if pollInterval <= 0 {
+		pollInterval = 250 * time.Millisecond
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		driveStatus, _, err := queryFn(devicePath)
+		if err == nil && driveStatus == CDS_DISC_OK {
+			return CDS_DISC_OK, nil
+		}
+
+		if timeout <= 0 || time.Now().After(deadline) {
+			if err != nil {
+				return driveStatus, fmt.Errorf("drive %s not ready (status=%s): %w", devicePath, DriveStatusString(driveStatus), err)
+			}
+			return driveStatus, fmt.Errorf("drive %s not ready: status=%s (%d)", devicePath, DriveStatusString(driveStatus), driveStatus)
+		}
+
+		wait := pollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return driveStatus, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
 // FSProbeFunc returns the filesystem type (e.g. "udf", "iso9660") detected on devicePath.
 type FSProbeFunc func(ctx context.Context, devicePath string) (string, error)
 

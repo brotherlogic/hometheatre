@@ -142,6 +142,10 @@ dvdbackup -M -r a -n dvd -i /dev/sr0 -o "<job_dir>"
   - Without `-n`, `dvdbackup` attempts to derive the folder name from the DVD title and **exits with return code `2`** if the disc has a generic (`DVD_VIDEO`), blank, or spaces-only volume title.
 - **`-r a` (`--error=a`):** Aborts immediately on the first unrecoverable sector read error (overriding `dvdbackup`'s default `-r m` skip-multiple-blocks mode).
   - Failing fast on the first unreadable/ARccOS dummy sector avoids spending 20+ minutes grinding on structural protection sectors in Stage 1 and immediately hands off to Stage 2 (`ddrescue`).
+- **Drive Readiness & Retry Backoff:**
+  - Before starting Stage 1, the daemon logs the initial `ProbeTarget` results (`blkid` volume label, `lsdvd` track count, and any `ProbeTarget` error).
+  - If `dvdbackup` fails, the daemon removes any partial `<job_dir>/dvd`, waits a short retry backoff (`2s`, `3s` — up to 3 total attempts), verifies drive readiness (`CDROM_DRIVE_STATUS == CDS_DISC_OK` via `drive.WaitForDiscReady`), and retries `dvdbackup` to ride through transient USB optical drive spin-up brownouts or settling races after `lsdvd` before falling back to Stage 2 (`ddrescue`).
+
 
 ### 3.2 Step 1B — Build Compliant DVD-Video `.iso` (`genisoimage`)
 ```bash

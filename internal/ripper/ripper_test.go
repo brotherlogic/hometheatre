@@ -1,6 +1,7 @@
 package ripper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/brotherlogic/hometheatre/internal/drive"
 )
 
 func TestSanitizeVolumeID(t *testing.T) {
@@ -426,17 +429,29 @@ func TestWorkerStage2LowRescuedRatioCleansUpAndEjects(t *testing.T) {
 
 	ejected := 0
 	enqueued := 0
+	dvdbackupAttempts := 0
+	var sleepDurations []time.Duration
 	var failedEvent *FailureEvent
 
 	w := NewWorker(scratchDir, "/dev/sr0")
 	w.Logger = log.New(io.Discard, "", 0)
 	w.Now = func() time.Time { return time.Date(2026, 10, 18, 16, 15, 0, 0, time.UTC) }
 	w.CheckSpace = func(dir string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
+	w.QueryDriveStatus = func(dev string) (int, int, error) {
+		return drive.CDS_DISC_OK, drive.CDS_DATA_1, nil
+	}
+	w.Sleep = func(ctx context.Context, d time.Duration) error {
+		sleepDurations = append(sleepDurations, d)
+		return nil
+	}
 	w.RunCommand = func(ctx context.Context, env []string, name string, args ...string) (string, error) {
 		switch name {
 		case "blkid":
 			return "SCRATCHED_DISC\n", nil
 		case "dvdbackup":
+			if len(args) > 0 && args[0] == "-M" {
+				dvdbackupAttempts++
+			}
 			return "dvdbackup: read error", errors.New("exit status 1")
 		case "lsdvd":
 			return "", nil
@@ -470,6 +485,12 @@ func TestWorkerStage2LowRescuedRatioCleansUpAndEjects(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected RipDisc to fail when rescuedRatio < 0.95")
 	}
+	if dvdbackupAttempts != 3 {
+		t.Fatalf("expected 3 Stage 1 dvdbackup attempts before falling back to Stage 2, got %d", dvdbackupAttempts)
+	}
+	if !reflect.DeepEqual(sleepDurations, DefaultStage1RetryBackoffs) {
+		t.Fatalf("expected Stage 1 retry backoffs %v, got %v", DefaultStage1RetryBackoffs, sleepDurations)
+	}
 	if enqueued != 0 {
 		t.Fatalf("expected broken ISO not to be enqueued, got enqueued=%d", enqueued)
 	}
@@ -482,6 +503,88 @@ func TestWorkerStage2LowRescuedRatioCleansUpAndEjects(t *testing.T) {
 	}
 	if failedEvent == nil || failedEvent.Stage != Stage2DDRescue || failedEvent.RescuedRatio >= 0.95 {
 		t.Fatalf("unexpected FailureEvent: %+v", failedEvent)
+	}
+}
+
+func TestWorkerStage1RetriesDVDBackupAfterTransientDriveReset(t *testing.T) {
+	ctx := context.Background()
+	scratchDir := t.TempDir()
+
+	var logBuf bytes.Buffer
+	dvdbackupAttempts := 0
+	statusChecks := 0
+	ddrescueCalled := false
+
+	w := NewWorker(scratchDir, "/dev/sr0")
+	w.Logger = log.New(&logBuf, "", 0)
+	w.Now = func() time.Time { return time.Date(2026, 10, 18, 22, 59, 26, 0, time.UTC) }
+	w.CheckSpace = func(dir string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
+	w.Stage1RetryBackoffs = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
+	w.QueryDriveStatus = func(dev string) (int, int, error) {
+		statusChecks++
+		if statusChecks == 1 {
+			// Simulate drive still settling / spinning up on first readiness check
+			return drive.CDS_DRIVE_NOT_READY, drive.CDS_NO_INFO, nil
+		}
+		return drive.CDS_DISC_OK, drive.CDS_DATA_1, nil
+	}
+	w.RunCommand = func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+		switch name {
+		case "blkid":
+			return "THE_MATRIX_16X9\n", nil
+		case "lsdvd":
+			return "", errors.New("libdvdread: Can't open /dev/sr0 for reading")
+		case "dvdbackup":
+			dvdbackupAttempts++
+			if dvdbackupAttempts == 1 {
+				return "libdvdread: DVDOpenFileUDF:UDFFindFile /VIDEO_TS/VIDEO_TS.IFO failed\nCannot open Video Manager (VMG) info.\nMirror of DVD failed",
+					errors.New("signal: segmentation fault (core dumped)")
+			}
+			jobDir := args[len(args)-1]
+			if err := os.MkdirAll(filepath.Join(jobDir, "dvd", "VIDEO_TS"), 0o755); err != nil {
+				return "", err
+			}
+			return "", nil
+		case "genisoimage":
+			outISO := args[5]
+			createSparseISO(t, outISO, MinISOSizeBytes+4096)
+			return "", nil
+		case "ddrescue":
+			ddrescueCalled = true
+			return "", nil
+		case "eject":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	job, err := w.RipDisc(ctx, "/dev/sr0")
+	if err != nil {
+		t.Fatalf("expected Stage 1 retry to succeed, got %v", err)
+	}
+	if dvdbackupAttempts != 2 {
+		t.Fatalf("expected dvdbackup to succeed on attempt 2, got %d attempts", dvdbackupAttempts)
+	}
+	if statusChecks < 2 {
+		t.Fatalf("expected WaitForDiscReady to poll until CDS_DISC_OK, got %d status checks", statusChecks)
+	}
+	if ddrescueCalled {
+		t.Fatalf("expected Stage 2 ddrescue not to be called when Stage 1 retry succeeds")
+	}
+	if job.Stage != Stage1GenISOImage || job.State != StateISOFinalized {
+		t.Fatalf("unexpected job state/stage: %+v", job)
+	}
+
+	logs := logBuf.String()
+	for _, wantLog := range []string{
+		`Initial probe on /dev/sr0: label="THE_MATRIX_16X9" (safe="THE_MATRIX_16X9"), tracks=0, err=libdvdread: Can't open /dev/sr0 for reading`,
+		`Stage 1 dvdbackup attempt 1/3 failed`,
+		`Drive /dev/sr0 ready (CDS_DISC_OK); retrying Stage 1 dvdbackup (attempt 2/3)`,
+	} {
+		if !strings.Contains(logs, wantLog) {
+			t.Errorf("expected daemon logs to contain %q, got:\n%s", wantLog, logs)
+		}
 	}
 }
 

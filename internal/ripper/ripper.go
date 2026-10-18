@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/brotherlogic/hometheatre/internal/drive"
 	"github.com/brotherlogic/hometheatre/internal/metadata"
 	"golang.org/x/sys/unix"
 )
@@ -47,15 +48,22 @@ const (
 	Stage2DDRescue    = "stage2_ddrescue"
 
 	// Worker live status strings for Web UI reporting
-	StatusIdle                    = "Idle"
-	StatusWaitingForScratch       = "Waiting for Scratch Space"
-	StatusRippingStage1DVDBackup  = "Ripping (stage1_dvdbackup)"
-	StatusRippingStage1GenISO     = "Ripping (stage1_genisoimage)"
-	StatusRippingStage2DDRescue   = "Ripping (stage2_ddrescue)"
+	StatusIdle                   = "Idle"
+	StatusWaitingForScratch      = "Waiting for Scratch Space"
+	StatusRippingStage1DVDBackup = "Ripping (stage1_dvdbackup)"
+	StatusRippingStage1GenISO    = "Ripping (stage1_genisoimage)"
+	StatusRippingStage2DDRescue  = "Ripping (stage2_ddrescue)"
 
 	// DefaultSpaceWaitInterval is the polling interval while waiting for an active NFS transfer to free scratch space.
 	DefaultSpaceWaitInterval = 2 * time.Second
 )
+
+// DefaultStage1RetryBackoffs defines the retry backoff schedule between Stage 1
+// dvdbackup attempts (up to 3 total attempts: initial + 2 retries with 2s, 3s backoff).
+var DefaultStage1RetryBackoffs = []time.Duration{
+	2 * time.Second,
+	3 * time.Second,
+}
 
 // ErrInsufficientScratchSpace is returned when available scratch disk space is < 18 GiB
 // and no in-flight or queued NFS transfer is freeing space.
@@ -340,8 +348,11 @@ type Worker struct {
 	MinFreeBytes        uint64
 	MinISOSize          int64
 	SpaceWaitInterval   time.Duration
+	Stage1RetryBackoffs []time.Duration
 	RunCommand          CommandRunner
 	CheckSpace          StatfsFunc
+	QueryDriveStatus    drive.StatusQueryFunc
+	Sleep               func(ctx context.Context, d time.Duration) error
 	HasPendingTransfers PendingTransfersFunc
 	OnJobFinalized      JobFinalizedHandler
 	OnRipFailed         RipFailedHandler
@@ -355,16 +366,18 @@ type Worker struct {
 // NewWorker constructs a Worker with production defaults for /dev/sr0 and /scratch.
 func NewWorker(scratchDir, devicePath string) *Worker {
 	return &Worker{
-		ScratchDir:        scratchDir,
-		DevicePath:        devicePath,
-		MinFreeBytes:      MinScratchFreeBytes,
-		MinISOSize:        MinISOSizeBytes,
-		SpaceWaitInterval: DefaultSpaceWaitInterval,
-		RunCommand:        DefaultCommandRunner,
-		CheckSpace:        CheckScratchSpace,
-		Now:               time.Now,
-		Logger:            log.Default(),
-		status:            StatusIdle,
+		ScratchDir:          scratchDir,
+		DevicePath:          devicePath,
+		MinFreeBytes:        MinScratchFreeBytes,
+		MinISOSize:          MinISOSizeBytes,
+		SpaceWaitInterval:   DefaultSpaceWaitInterval,
+		Stage1RetryBackoffs: DefaultStage1RetryBackoffs,
+		RunCommand:          DefaultCommandRunner,
+		CheckSpace:          CheckScratchSpace,
+		QueryDriveStatus:    drive.QueryDriveStatus,
+		Now:                 time.Now,
+		Logger:              log.Default(),
+		status:              StatusIdle,
 	}
 }
 
@@ -402,7 +415,7 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 	}
 
 	// 2. Probe raw volume label (blkid primary, lsdvd -Ox <title> fallback) and track durations (lsdvd -Ox)
-	probeRes, _ := metadata.ProbeTarget(ctx, w.runCmd, w.dvdcssEnv(), devicePath)
+	probeRes, probeErr := metadata.ProbeTarget(ctx, w.runCmd, w.dvdcssEnv(), devicePath)
 	rawLabel := ""
 	tracksSeconds := []float64{}
 	if probeRes != nil {
@@ -433,6 +446,14 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 	if err := WriteJobFile(jobDir, job); err != nil {
 		_ = os.RemoveAll(jobDir)
 		return nil, err
+	}
+
+	if probeErr != nil {
+		w.logf("[%s] Initial probe on %s: label=%q (safe=%q), tracks=%d, err=%v",
+			job.JobID, devicePath, rawLabel, safeLabel, len(tracksSeconds), probeErr)
+	} else {
+		w.logf("[%s] Initial probe on %s: label=%q (safe=%q), tracks=%d, err=nil",
+			job.JobID, devicePath, rawLabel, safeLabel, len(tracksSeconds))
 	}
 
 	// 3. Stage 1: dvdbackup + genisoimage
@@ -547,9 +568,39 @@ func (w *Worker) runStage1(ctx context.Context, devicePath, safeLabel string, jo
 	w.setStatus(StatusRippingStage1DVDBackup)
 
 	env := w.dvdcssEnv()
-	if out, err := w.runCmd(ctx, env, "dvdbackup", "-M", "-r", "a", "-n", "dvd", "-i", devicePath, "-o", job.JobDir); err != nil {
-		_ = os.RemoveAll(filepath.Join(job.JobDir, "dvd"))
-		return fmt.Errorf("dvdbackup failed: %w (output: %s)", err, tailString(out, 512))
+	dvdDir := filepath.Join(job.JobDir, "dvd")
+	backoffs := w.stage1Backoffs()
+	totalAttempts := len(backoffs) + 1
+
+	var lastErr error
+	for attempt := 1; attempt <= totalAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := backoffs[attempt-2]
+			w.logf("[%s] Stage 1 dvdbackup attempt %d/%d failed (%v); backing off %s and verifying drive readiness before retry",
+				job.JobID, attempt-1, totalAttempts, lastErr, backoff)
+			if err := w.sleep(ctx, backoff); err != nil {
+				return err
+			}
+			if _, readyErr := drive.WaitForDiscReady(ctx, devicePath, w.queryDriveStatusFn(), backoff, backoff/4); readyErr != nil {
+				w.logf("[%s] Stage 1 dvdbackup retry %d/%d skipped: drive %s not ready (%v)",
+					job.JobID, attempt, totalAttempts, devicePath, readyErr)
+				lastErr = fmt.Errorf("dvdbackup retry %d/%d drive not ready (%w); last error: %v", attempt, totalAttempts, readyErr, lastErr)
+				continue
+			}
+			w.logf("[%s] Drive %s ready (CDS_DISC_OK); retrying Stage 1 dvdbackup (attempt %d/%d)",
+				job.JobID, devicePath, attempt, totalAttempts)
+		}
+
+		out, err := w.runCmd(ctx, env, "dvdbackup", "-M", "-r", "a", "-n", "dvd", "-i", devicePath, "-o", job.JobDir)
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		_ = os.RemoveAll(dvdDir)
+		lastErr = fmt.Errorf("dvdbackup failed: %w (output: %s)", err, tailString(out, 512))
+	}
+	if lastErr != nil {
+		return lastErr
 	}
 
 	// Step 1B: genisoimage -quiet -dvd-video -V <SAFE_LABEL_32> -o <job_dir>/disc.iso <job_dir>/dvd
@@ -557,7 +608,6 @@ func (w *Worker) runStage1(ctx context.Context, devicePath, safeLabel string, jo
 	_ = WriteJobFile(job.JobDir, job)
 	w.setStatus(StatusRippingStage1GenISO)
 
-	dvdDir := filepath.Join(job.JobDir, "dvd")
 	out, err := w.runCmd(ctx, env, "genisoimage", "-quiet", "-dvd-video", "-V", safeLabel, "-o", job.ISOPath, dvdDir)
 	// Always delete <job_dir>/dvd once genisoimage finishes
 	_ = os.RemoveAll(dvdDir)
@@ -567,6 +617,35 @@ func (w *Worker) runStage1(ctx context.Context, devicePath, safeLabel string, jo
 	}
 
 	return nil
+}
+
+func (w *Worker) stage1Backoffs() []time.Duration {
+	if w.Stage1RetryBackoffs != nil {
+		return w.Stage1RetryBackoffs
+	}
+	return DefaultStage1RetryBackoffs
+}
+
+func (w *Worker) queryDriveStatusFn() drive.StatusQueryFunc {
+	if w.QueryDriveStatus != nil {
+		return w.QueryDriveStatus
+	}
+	return drive.QueryDriveStatus
+}
+
+func (w *Worker) sleep(ctx context.Context, d time.Duration) error {
+	if w.Sleep != nil {
+		return w.Sleep(ctx, d)
+	}
+	if d <= 0 {
+		return ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
 }
 
 func (w *Worker) runStage2(ctx context.Context, devicePath string, job *Job) (float64, string, error) {

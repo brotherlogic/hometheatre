@@ -220,3 +220,28 @@ func TestPollerRunContextCancellation(t *testing.T) {
 		t.Fatalf("expected at least 2 polls during Run, got %d", polls)
 	}
 }
+
+func TestWaitForDiscReady(t *testing.T) {
+	ctx := context.Background()
+
+	// Case 1: Drive transitions from CDS_DRIVE_NOT_READY to CDS_DISC_OK within timeout
+	calls := 0
+	status, err := WaitForDiscReady(ctx, "/dev/sr0", func(dev string) (int, int, error) {
+		calls++
+		if calls < 3 {
+			return CDS_DRIVE_NOT_READY, CDS_NO_INFO, nil
+		}
+		return CDS_DISC_OK, CDS_DATA_1, nil
+	}, 50*time.Millisecond, 5*time.Millisecond)
+	if err != nil || status != CDS_DISC_OK || calls != 3 {
+		t.Fatalf("expected CDS_DISC_OK after 3 calls, got status=%d calls=%d err=%v", status, calls, err)
+	}
+
+	// Case 2: Drive remains CDS_DRIVE_NOT_READY past timeout
+	status, err = WaitForDiscReady(ctx, "/dev/sr0", func(dev string) (int, int, error) {
+		return CDS_DRIVE_NOT_READY, CDS_NO_INFO, nil
+	}, 15*time.Millisecond, 5*time.Millisecond)
+	if err == nil || status != CDS_DRIVE_NOT_READY {
+		t.Fatalf("expected error with CDS_DRIVE_NOT_READY on timeout, got status=%d err=%v", status, err)
+	}
+}
