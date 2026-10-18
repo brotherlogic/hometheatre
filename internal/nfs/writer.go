@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,14 +65,18 @@ func WithNFSUser(puid, pgid int, fn func() error) error {
 
 // TransferOutcome describes the final destination and metadata of a completed NFS transfer.
 type TransferOutcome struct {
-	JobID          string
-	RawLabel       string
-	Classification string
-	AutoFiled      bool
-	Reason         string
-	FinalISOPath   string
-	FinalNFOPath   string
-	ProbeJSONPath  string
+	JobID             string
+	RawLabel          string
+	Title             string
+	Classification    string
+	Stage             string
+	AutoFiled         bool
+	Reason            string
+	EstimatedEpisodes int
+	RescuedRatio      float64
+	FinalISOPath      string
+	FinalNFOPath      string
+	ProbeJSONPath     string
 }
 
 // TransferRetryEvent is emitted when a scratch -> NFS transfer fails transiently and enters retry backoff.
@@ -346,8 +351,11 @@ func (w *Writer) TransferMovie(job *ripper.Job, movie *metadata.TMDBMovieDetails
 	return &TransferOutcome{
 		JobID:          job.JobID,
 		RawLabel:       job.RawLabel,
+		Title:          fileBase,
 		Classification: metadata.MediaTypeMovie,
+		Stage:          job.Stage,
 		AutoFiled:      true,
+		RescuedRatio:   job.RescuedRatio,
 		FinalISOPath:   finalISOPath,
 		FinalNFOPath:   finalNFOPath,
 	}, nil
@@ -438,14 +446,99 @@ func (w *Writer) TransferUnidentified(job *ripper.Job, decision *metadata.Routin
 	}
 
 	return &TransferOutcome{
-		JobID:          job.JobID,
-		RawLabel:       rawLabel,
-		Classification: decision.Classification,
-		AutoFiled:      false,
-		Reason:         decision.Reason,
-		FinalISOPath:   finalISOPath,
-		ProbeJSONPath:  finalProbePath,
+		JobID:             job.JobID,
+		RawLabel:          rawLabel,
+		Classification:    decision.Classification,
+		Stage:             job.Stage,
+		AutoFiled:         false,
+		Reason:            decision.Reason,
+		EstimatedEpisodes: decision.Hints.EstimatedEpisodes,
+		RescuedRatio:      job.RescuedRatio,
+		FinalISOPath:      finalISOPath,
+		ProbeJSONPath:     finalProbePath,
 	}, nil
+}
+
+// ListUnidentified scans <NFS_ROOT>/unidentified/*.probe.json statelessly and returns all
+// parsed ProbeSidecar records sorted newest-first by ProbedAt (METADATA.md Section 4).
+func (w *Writer) ListUnidentified() ([]*metadata.ProbeSidecar, error) {
+	unidDir := filepath.Join(w.NFSRoot, "unidentified")
+	var items []*metadata.ProbeSidecar
+
+	err := w.withNFSUser(func() error {
+		entries, err := os.ReadDir(unidDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("readdir %s: %w", unidDir, err)
+		}
+
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".probe.json") {
+				continue
+			}
+			probePath := filepath.Join(unidDir, name)
+			sidecar, err := metadata.ReadProbeSidecar(probePath)
+			if err != nil {
+				w.logf("Warning: failed to parse %s: %v", probePath, err)
+				continue
+			}
+			if strings.TrimSpace(sidecar.ISOFilename) == "" {
+				sidecar.ISOFilename = strings.TrimSuffix(name, ".probe.json") + ".iso"
+			}
+			items = append(items, sidecar)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ProbedAt != items[j].ProbedAt {
+			return items[i].ProbedAt > items[j].ProbedAt
+		}
+		return items[i].ISOFilename < items[j].ISOFilename
+	})
+	return items, nil
+}
+
+// DeleteUnidentified removes an unidentified .iso and its companion .probe.json from
+// <NFS_ROOT>/unidentified/ (METADATA.md Section 5.4 option 3).
+func (w *Writer) DeleteUnidentified(unidentifiedISOFilename string) error {
+	base := filepath.Base(strings.TrimSpace(unidentifiedISOFilename))
+	if base == "" || base == "." || base == ".." || base == "/" {
+		return errors.New("invalid unidentified filename")
+	}
+	if strings.HasSuffix(base, ".probe.json") {
+		base = strings.TrimSuffix(base, ".probe.json") + ".iso"
+	} else if !strings.HasSuffix(strings.ToLower(base), ".iso") {
+		base = base + ".iso"
+	}
+
+	unidDir := filepath.Join(w.NFSRoot, "unidentified")
+	isoPath := filepath.Join(unidDir, base)
+	probePath := filepath.Join(unidDir, strings.TrimSuffix(base, filepath.Ext(base))+".probe.json")
+
+	return w.withNFSUser(func() error {
+		isoErr := os.Remove(isoPath)
+		probeErr := os.Remove(probePath)
+		if isoErr != nil && !os.IsNotExist(isoErr) {
+			return fmt.Errorf("remove %s: %w", isoPath, isoErr)
+		}
+		if probeErr != nil && !os.IsNotExist(probeErr) {
+			return fmt.Errorf("remove %s: %w", probePath, probeErr)
+		}
+		if os.IsNotExist(isoErr) && os.IsNotExist(probeErr) {
+			return fmt.Errorf("unidentified disc %s not found", base)
+		}
+		return nil
+	})
 }
 
 // TagUnidentifiedAsMovie performs a zero-copy server-side os.Rename of an .iso in

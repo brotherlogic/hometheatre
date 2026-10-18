@@ -390,6 +390,50 @@ func TestZeroCopyTaggingFromUnidentifiedToMovieAndTV(t *testing.T) {
 	}
 }
 
+func TestListAndDeleteUnidentified(t *testing.T) {
+	nfsRoot := t.TempDir()
+	unidDir := filepath.Join(nfsRoot, "unidentified")
+	if err := os.MkdirAll(unidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := NewWriter(nfsRoot, 1000, 1000, nil)
+	writer.Logger = log.New(io.Discard, "", 0)
+
+	sc1, _ := metadata.MarshalProbeSidecar(&metadata.ProbeSidecar{
+		ISOFilename:    "DISC_A_20261018T140000Z.iso",
+		ProbedAt:       "2026-10-18T14:00:00Z",
+		RawLabel:       "DISC_A",
+		Classification: metadata.MediaTypeMovie,
+	})
+	sc2, _ := metadata.MarshalProbeSidecar(&metadata.ProbeSidecar{
+		ISOFilename:    "DISC_B_20261018T150000Z.iso",
+		ProbedAt:       "2026-10-18T15:00:00Z",
+		RawLabel:       "DISC_B",
+		Classification: metadata.MediaTypeTVSeries,
+	})
+	_ = os.WriteFile(filepath.Join(unidDir, "DISC_A_20261018T140000Z.iso"), []byte("iso-a"), 0o644)
+	_ = os.WriteFile(filepath.Join(unidDir, "DISC_A_20261018T140000Z.probe.json"), sc1, 0o644)
+	_ = os.WriteFile(filepath.Join(unidDir, "DISC_B_20261018T150000Z.iso"), []byte("iso-b"), 0o644)
+	_ = os.WriteFile(filepath.Join(unidDir, "DISC_B_20261018T150000Z.probe.json"), sc2, 0o644)
+
+	items, err := writer.ListUnidentified()
+	if err != nil {
+		t.Fatalf("ListUnidentified failed: %v", err)
+	}
+	if len(items) != 2 || items[0].RawLabel != "DISC_B" || items[1].RawLabel != "DISC_A" {
+		t.Fatalf("expected 2 sorted items (DISC_B then DISC_A), got %+v", items)
+	}
+
+	if err := writer.DeleteUnidentified("DISC_A_20261018T140000Z.iso"); err != nil {
+		t.Fatalf("DeleteUnidentified failed: %v", err)
+	}
+	itemsAfter, err := writer.ListUnidentified()
+	if err != nil || len(itemsAfter) != 1 || itemsAfter[0].RawLabel != "DISC_B" {
+		t.Fatalf("expected 1 remaining item DISC_B after delete, got %+v (err=%v)", itemsAfter, err)
+	}
+}
+
 func newMockTMDBServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()

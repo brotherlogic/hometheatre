@@ -3,18 +3,24 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/brotherlogic/hometheatre/internal/drive"
+	"github.com/brotherlogic/hometheatre/internal/history"
 	"github.com/brotherlogic/hometheatre/internal/metadata"
 	"github.com/brotherlogic/hometheatre/internal/nfs"
 	"github.com/brotherlogic/hometheatre/internal/ripper"
+	"github.com/brotherlogic/hometheatre/internal/webhook"
+	"github.com/brotherlogic/hometheatre/internal/webui"
 )
 
 func main() {
@@ -24,9 +30,22 @@ func main() {
 	puid := envIntOrDefault("PUID", 1000)
 	pgid := envIntOrDefault("PGID", 1000)
 	tmdbAPIKey := os.Getenv("TMDB_API_KEY")
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	webPort := envOrDefault("WEB_PORT", "8080")
+	webAddr := envOrDefault("WEB_ADDR", ":"+strings.TrimPrefix(webPort, ":"))
+
+	logBuf := history.NewLogBuffer(history.DefaultMaxLogLines)
+	log.SetOutput(io.MultiWriter(os.Stderr, logBuf))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	histStore, err := history.NewStore(scratchDir)
+	if err != nil {
+		log.Printf("Warning: failed to load history.json from %s: %v", scratchDir, err)
+	}
+	notifier := webhook.NewNotifier(webhookURL)
+	defer notifier.Wait()
 
 	transferQueue := make(chan *ripper.Job, 64)
 
@@ -36,9 +55,55 @@ func main() {
 	nfsWriter.OnTransferCompleted = func(outcome nfs.TransferOutcome) {
 		if outcome.AutoFiled {
 			log.Printf("Auto-filed movie %s -> %s", outcome.JobID, outcome.FinalISOPath)
+			_ = histStore.Record(history.Entry{
+				JobID:          outcome.JobID,
+				RawLabel:       outcome.RawLabel,
+				Title:          outcome.Title,
+				Classification: outcome.Classification,
+				Status:         history.StatusCompleted,
+				Stage:          outcome.Stage,
+				ISOPath:        outcome.FinalISOPath,
+				RescuedRatio:   outcome.RescuedRatio,
+			})
+			notifier.SendAsync(notifier.BuildCompletedPayload(
+				outcome.RawLabel,
+				outcome.Classification,
+				outcome.Stage,
+				outcome.FinalISOPath,
+			))
 		} else {
 			log.Printf("Moved %s (%s, reason=%s) -> %s",
 				outcome.JobID, outcome.Classification, outcome.Reason, outcome.FinalISOPath)
+			_ = histStore.Record(history.Entry{
+				JobID:          outcome.JobID,
+				RawLabel:       outcome.RawLabel,
+				Classification: outcome.Classification,
+				Status:         history.StatusUnidentified,
+				Stage:          outcome.Stage,
+				ISOPath:        outcome.FinalISOPath,
+				Reason:         outcome.Reason,
+				RescuedRatio:   outcome.RescuedRatio,
+			})
+			notifier.SendAsync(notifier.BuildUnidentifiedPayload(
+				outcome.RawLabel,
+				outcome.Classification,
+				outcome.Stage,
+				outcome.FinalISOPath,
+				outcome.Reason,
+				outcome.EstimatedEpisodes,
+			))
+		}
+	}
+	nfsWriter.OnTransferRetry = func(ev nfs.TransferRetryEvent) {
+		if ev.Attempt == 1 {
+			notifier.SendAsync(notifier.BuildFailedPayload(
+				ev.RawLabel,
+				"",
+				"nfs_transfer_retry",
+				"",
+				ev.Err.Error(),
+				0,
+			))
 		}
 	}
 
@@ -74,6 +139,27 @@ func main() {
 	worker.OnRipFailed = func(ev ripper.FailureEvent) {
 		log.Printf("Rip failed (job=%s, label=%q, stage=%s, reason=%s, rescued=%.2f%%): %v",
 			ev.JobID, ev.RawLabel, ev.Stage, ev.Reason, ev.RescuedRatio*100, ev.Err)
+		logTail := ev.StderrTail
+		if logTail == "" && ev.Err != nil {
+			logTail = ev.Err.Error()
+		}
+		_ = histStore.Record(history.Entry{
+			JobID:        ev.JobID,
+			RawLabel:     ev.RawLabel,
+			Status:       history.StatusFailed,
+			Stage:        ev.Stage,
+			Reason:       ev.Reason,
+			RescuedRatio: ev.RescuedRatio,
+			Log:          logTail,
+		})
+		notifier.SendAsync(notifier.BuildFailedPayload(
+			ev.RawLabel,
+			"",
+			ev.Stage,
+			"",
+			ev.Reason,
+			ev.RescuedRatio,
+		))
 	}
 
 	recovered, err := ripper.ReconcileScratch(scratchDir, worker.OnJobFinalized)
@@ -87,6 +173,31 @@ func main() {
 		_, err := worker.RipDisc(ctx, dev)
 		return err
 	})
+
+	uiServer := webui.NewServer(poller, worker, nfsWriter, tmdbClient, histStore, logBuf, notifier)
+	uiServer.QueueCountFunc = func() int {
+		return len(transferQueue)
+	}
+
+	httpSrv := &http.Server{
+		Addr:              webAddr,
+		Handler:           uiServer,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		log.Printf("Starting HomeTheatre Web UI on %s", webAddr)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("Web UI server error: %v", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}()
 
 	log.Printf("Starting HomeTheatre optical drive poller on %s (scratch=%s, nfs=%s, puid=%d, pgid=%d)",
 		devicePath, scratchDir, nfsRoot, puid, pgid)
