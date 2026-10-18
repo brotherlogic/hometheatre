@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/brotherlogic/hometheatre/internal/metadata"
 	"golang.org/x/sys/unix"
 )
 
@@ -400,8 +401,16 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 		return nil, err
 	}
 
-	// 2. Probe raw volume label via blkid
-	rawLabel := w.probeVolumeLabel(ctx, devicePath)
+	// 2. Probe raw volume label (blkid primary, lsdvd -Ox <title> fallback) and track durations (lsdvd -Ox)
+	probeRes, _ := metadata.ProbeTarget(ctx, w.runCmd, w.dvdcssEnv(), devicePath)
+	rawLabel := ""
+	tracksSeconds := []float64{}
+	if probeRes != nil {
+		rawLabel = probeRes.RawLabel
+		if len(probeRes.TracksSeconds) > 0 {
+			tracksSeconds = probeRes.TracksSeconds
+		}
+	}
 	safeLabel := SanitizeVolumeID(rawLabel)
 
 	now := w.nowUTC()
@@ -417,7 +426,7 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 		State:         StateRipping,
 		Stage:         Stage1DVDBackup,
 		RawLabel:      rawLabel,
-		TracksSeconds: []float64{},
+		TracksSeconds: tracksSeconds,
 		JobDir:        jobDir,
 		ISOPath:       filepath.Join(jobDir, "disc.iso"),
 	}
@@ -631,18 +640,30 @@ func (w *Worker) finalizeAndEject(ctx context.Context, devicePath string, job *J
 	// Immediately eject physical DVD before starting asynchronous TMDB + NFS transfer
 	w.ejectBestEffort(ctx, devicePath)
 
+	// Two-point probe timing (METADATA.md Section 1.1):
+	// Re-probe the finalized local <job_dir>/disc.iso after ejecting if the initial /dev/sr0
+	// probe failed or returned zero valid tracks.
+	if metadata.NeedsTrackReprobe(job.TracksSeconds) || metadata.NeedsLabelReprobe(job.RawLabel) {
+		if reprobe, _ := metadata.ProbeTarget(ctx, w.runCmd, w.dvdcssEnv(), job.ISOPath); reprobe != nil {
+			updated := false
+			if metadata.NeedsLabelReprobe(job.RawLabel) && reprobe.RawLabel != "" {
+				job.RawLabel = reprobe.RawLabel
+				updated = true
+			}
+			if metadata.NeedsTrackReprobe(job.TracksSeconds) && len(reprobe.TracksSeconds) > 0 {
+				job.TracksSeconds = reprobe.TracksSeconds
+				updated = true
+			}
+			if updated {
+				_ = WriteJobFile(job.JobDir, job)
+			}
+		}
+	}
+
 	if w.OnJobFinalized != nil {
 		w.OnJobFinalized(job)
 	}
 	return job, nil
-}
-
-func (w *Worker) probeVolumeLabel(ctx context.Context, devicePath string) string {
-	out, err := w.runCmd(ctx, nil, "blkid", "-o", "value", "-s", "LABEL", devicePath)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(out)
 }
 
 func (w *Worker) validateISOSize(isoPath string) bool {

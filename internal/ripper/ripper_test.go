@@ -260,6 +260,8 @@ func TestWorkerStage1SuccessFlow(t *testing.T) {
 		switch name {
 		case "blkid":
 			return "THE_MATRIX_16X9\n", nil
+		case "lsdvd":
+			return `<?xml version="1.0" encoding="UTF-8"?><lsdvd><title>THE_MATRIX_16X9</title><track><ix>1</ix><length>8160.200</length></track></lsdvd>`, nil
 		case "dvdbackup":
 			dvdcssEnvSeen = env
 			jobDir := args[len(args)-1]
@@ -291,6 +293,7 @@ func TestWorkerStage1SuccessFlow(t *testing.T) {
 	expectedJobDir := filepath.Join(scratchDir, "job_20261018T153000Z")
 	wantCommands := [][]string{
 		{"blkid", "-o", "value", "-s", "LABEL", "/dev/sr0"},
+		{"lsdvd", "-Ox", "/dev/sr0"},
 		{"dvdbackup", "-M", "-r", "a", "-n", "dvd", "-i", "/dev/sr0", "-o", expectedJobDir},
 		{"genisoimage", "-quiet", "-dvd-video", "-V", "THE_MATRIX_16X9", "-o", filepath.Join(expectedJobDir, "disc.iso"), filepath.Join(expectedJobDir, "dvd")},
 		{"eject", "/dev/sr0"},
@@ -321,6 +324,9 @@ func TestWorkerStage1SuccessFlow(t *testing.T) {
 	}
 	if persisted.State != StateISOFinalized || persisted.Stage != Stage1GenISOImage {
 		t.Fatalf("unexpected persisted job state/stage: %+v", persisted)
+	}
+	if len(persisted.TracksSeconds) != 1 || persisted.TracksSeconds[0] != 8160.2 {
+		t.Fatalf("expected persisted TracksSeconds=[8160.2], got %v", persisted.TracksSeconds)
 	}
 	if !ejectedBeforeFinalizeCallback || finalizedJob == nil || finalizedJob.JobID != job.JobID {
 		t.Fatalf("expected physical disc to be ejected immediately and job enqueued")
@@ -355,8 +361,12 @@ func TestWorkerStage1GenISOFailureFallsBackToStage2DDRescue(t *testing.T) {
 			// Simulate genisoimage failing due to overlapping ARccOS IFO pointers
 			return "genisoimage: Inode number overflow / malformed IFO table", errors.New("exit status 255")
 		case "lsdvd":
-			// Simulate lsdvd -x failing so fallback to dvdbackup -I is also exercised
-			return "", errors.New("lsdvd failed")
+			// Simulate lsdvd failing on physical /dev/sr0 (exercising both dvdbackup -I CSS fallback
+			// and automatic post-eject re-probe of the finalized local disc.iso)
+			if len(args) >= 2 && strings.HasSuffix(args[len(args)-1], "disc.iso") {
+				return `<?xml version="1.0" encoding="UTF-8"?><lsdvd><title>SONY_ARCCOS_MOVIE</title><track><ix>1</ix><length>7320.500</length></track></lsdvd>`, nil
+			}
+			return "", errors.New("lsdvd failed on physical drive")
 		case "ddrescue":
 			isoPath := args[len(args)-2]
 			mapPath := args[len(args)-1]
@@ -386,20 +396,27 @@ func TestWorkerStage1GenISOFailureFallsBackToStage2DDRescue(t *testing.T) {
 	}
 
 	expectedJobDir := filepath.Join(scratchDir, "job_20261018T160000Z")
+	expectedISOPath := filepath.Join(expectedJobDir, "disc.iso")
 	wantCommands := [][]string{
 		{"blkid", "-o", "value", "-s", "LABEL", "/dev/sr0"},
+		{"lsdvd", "-Ox", "/dev/sr0"},
 		{"dvdbackup", "-M", "-r", "a", "-n", "dvd", "-i", "/dev/sr0", "-o", expectedJobDir},
-		{"genisoimage", "-quiet", "-dvd-video", "-V", "SONY_ARCCOS_MOVIE", "-o", filepath.Join(expectedJobDir, "disc.iso"), filepath.Join(expectedJobDir, "dvd")},
+		{"genisoimage", "-quiet", "-dvd-video", "-V", "SONY_ARCCOS_MOVIE", "-o", expectedISOPath, filepath.Join(expectedJobDir, "dvd")},
 		{"lsdvd", "-x", "/dev/sr0"},
 		{"dvdbackup", "-I", "-i", "/dev/sr0"},
-		{"ddrescue", "-b", "2048", "-n", "-N", "-K", "64Ki,1Mi", "-O", "-T", "2m", "/dev/sr0", filepath.Join(expectedJobDir, "disc.iso"), filepath.Join(expectedJobDir, "ddrescue.map")},
+		{"ddrescue", "-b", "2048", "-n", "-N", "-K", "64Ki,1Mi", "-O", "-T", "2m", "/dev/sr0", expectedISOPath, filepath.Join(expectedJobDir, "ddrescue.map")},
 		{"eject", "/dev/sr0"},
+		{"blkid", "-o", "value", "-s", "LABEL", expectedISOPath},
+		{"lsdvd", "-Ox", expectedISOPath},
 	}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("commands mismatch:\ngot:  %v\nwant: %v", commands, wantCommands)
 	}
 	if finalizedJob == nil || job.Stage != Stage2DDRescue || job.State != StateISOFinalized || job.RescuedRatio < 0.95 {
 		t.Fatalf("unexpected finalized job after Stage 2: %+v", job)
+	}
+	if len(job.TracksSeconds) != 1 || job.TracksSeconds[0] != 7320.5 {
+		t.Fatalf("expected re-probed TracksSeconds=[7320.5], got %v", job.TracksSeconds)
 	}
 }
 
