@@ -22,8 +22,6 @@ To make the host mount persistent across reboots, add this line to `/etc/fstab` 
 <NAS_IP>:<NAS_EXPORT_PATH> /mnt/nfs nfs rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime,_netdev 0 0
 ```
 
-*(Note: If `/mnt/nfs` is not yet mounted when you run `sudo ./install.sh`, `install.sh` will automatically mount it for you during setup and print the exact `/etc/fstab` line for your NAS).*
-
 ### 2. Run the Host Installer
 Attach a physical DVD drive (`/dev/sr0`) to your Linux host and run:
 
@@ -38,11 +36,11 @@ sudo ./install.sh --reconfigure
 ```
 
 ### What `install.sh` Does Automatically
-1. **Host & DevPod Prerequisites:** Verifies `devpod` (`devpod-cli`) and required host utilities (`nfs-common`, `dnsutils`, `util-linux`, `lsscsi`, `udev`, `curl`).
+1. **Host & DevPod Prerequisites:** Verifies `devpod` (`devpod-cli`) and required host utilities (`util-linux`, `lsscsi`, `udev`, `curl`).
 2. **SCSI Generic (`sg`) Persistence:** Loads `modprobe sg` and persists `/etc/modules-load.d/hometheatre-sg.conf` so `libdvdcss2` can perform hardware CSS key exchange across reboots.
 3. **Optical Drive Discovery:** Scans `/sys/class/block/sr*` and `/device/scsi_generic/sg*` to map both block (`/dev/sr0`) and character (`/dev/sg*`) devices plus `CDROM_GID`.
 4. **Scratch Disk Gate:** Verifies `SCRATCH_DIR` has at least **`25 GiB`** of free local disk space (`30+ GiB` recommended for back-to-back dual-layer `DVD-9` ripping).
-5. **Host NFS Mount & `root_squash` Ownership:** Resolves `NFS_SERVER` to `NFS_SERVER_IP`, verifies (or mounts) `HOST_NFS_DIR` (`/mnt/nfs`), auto-detects share `PUID`/`PGID`, and tests write permissions via `setpriv` to initialize `movies/`, `tv/`, and `unidentified/`.
+5. **Host NFS Bind Mount & `root_squash` Ownership:** Verifies `HOST_NFS_DIR` (`/mnt/nfs`), auto-detects share `PUID`/`PGID`, and tests write permissions via `setpriv` to initialize `movies/`, `tv/`, and `unidentified/`.
 6. **TMDB API Validation:** Verifies your `TMDB_API_KEY` (supports both v3 32-character hex API keys and v4 `Bearer` Read Access Tokens) against `https://api.themoviedb.org/3/configuration`.
 7. **Standalone DevPod Daemon Deployment:** Renders [`deploy/devcontainer.json`](deploy/devcontainer.json) with your host bind mounts (`SCRATCH_DIR` -> `/scratch`, `HOST_NFS_DIR` -> `/mnt/nfs`) and optical device passthrough, then builds and launches the standalone `hometheatre-daemon` DevPod workspace via `devpod up . --id hometheatre-daemon --devcontainer-path deploy/devcontainer.json --ide none --recreate` (completely separate from the `.devcontainer/` development container).
 

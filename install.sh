@@ -3,20 +3,18 @@
 # Home Theatre: Idempotent Linux Host Installer for DevPod (install.sh)
 # ==============================================================================
 # Responsibilities (per INTENT.md 4.1, DRIVE.md 3, METADATA.md 3.4, DOCKER.md 3):
-# 1. Check host prerequisites (devpod / devpod-cli, nfs-common / mount.nfs,
-#    dnsutils / getent, util-linux / setpriv, lsscsi, udev, curl).
+# 1. Check host prerequisites (devpod / devpod-cli, util-linux / setpriv,
+#    lsscsi, udev, curl).
 # 2. Load and persist the generic SCSI kernel module (modprobe sg +
 #    /etc/modules-load.d/hometheatre-sg.conf).
 # 3. Auto-detect physical optical drives via sysfs (/sys/class/block/sr* and
 #    /device/scsi_generic/sg*), handling 0, 1, or multiple drives cleanly.
-# 4. Prompt for or validate .env configuration (HOST_NFS_DIR, NFS_SERVER,
-#    NFS_PATH, TMDB_API_KEY, SCRATCH_DIR, WEB_PORT, optional WEBHOOK_URL,
-#    DAEMON_WORKSPACE_ID).
+# 4. Prompt for or validate .env configuration (HOST_NFS_DIR, TMDB_API_KEY,
+#    SCRATCH_DIR, WEB_PORT, optional WEBHOOK_URL, DAEMON_WORKSPACE_ID).
 # 5. Verify SCRATCH_DIR has at least 25 GiB (26,843,545,600 bytes) of free space.
-# 6. Resolve NFS_SERVER -> NFS_SERVER_IP via getent ahostsv4, ensure or mount
-#    the NAS share on the host at HOST_NFS_DIR (default /mnt/nfs), auto-detect
-#    share owner PUID/PGID, and test root_squash-compatible write access via
-#    setpriv to initialize movies/, tv/, and unidentified/.
+# 6. Verify the host bind-mount directory HOST_NFS_DIR (default /mnt/nfs),
+#    auto-detect share owner PUID/PGID, and test root_squash-compatible write
+#    access via setpriv to initialize movies/, tv/, and unidentified/.
 # 7. Validate TMDB_API_KEY against the TMDB API (v3 ?api_key= & v4 Bearer eyJ...).
 # 8. Render deploy/devcontainer.json with host bind mounts (SCRATCH_DIR -> /scratch,
 #    HOST_NFS_DIR -> /mnt/nfs) and optical device passthrough, then build & launch
@@ -36,9 +34,6 @@ TMDB_API_BASE_URL="${TMDB_API_BASE_URL:-https://api.themoviedb.org/3}"
 
 MIN_SCRATCH_BYTES=26843545600 # 25 GiB (25 * 1024^3)
 REC_SCRATCH_BYTES=32212254720 # 30 GiB (30 * 1024^3)
-
-NFS_OPTS_V4="rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime"
-NFS_OPTS_V3="rw,nfsvers=3,nolock,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime"
 
 RECONFIGURE=0
 NON_INTERACTIVE=0
@@ -169,8 +164,6 @@ install_prerequisites() {
 
     if [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
         local base_pkgs=(
-            nfs-common
-            dnsutils
             util-linux
             lsscsi
             udev
@@ -407,7 +400,7 @@ load_env_file() {
                         EXPLICIT_PGID=1
                     fi
                     ;;
-                CDROM_GID|HOST_NFS_DIR|NFS_SERVER|NFS_SERVER_IP|NFS_PATH|NFS_OPTS|SCRATCH_DIR|TMDB_API_KEY|WEB_PORT|WEBHOOK_URL|DAEMON_WORKSPACE_ID)
+                CDROM_GID|HOST_NFS_DIR|SCRATCH_DIR|TMDB_API_KEY|WEB_PORT|WEBHOOK_URL|DAEMON_WORKSPACE_ID)
                     if [[ -z "${!key:-}" ]]; then
                         printf -v "$key" '%s' "$val"
                     fi
@@ -479,17 +472,6 @@ prompt_and_validate_config() {
         HOST_NFS_DIR="${HOST_NFS_DIR%/}"
     fi
 
-    prompt_value "NFS_SERVER" "Enter NAS NFS server hostname or IP (e.g., nas.local or 192.168.1.50)" "" 1
-    prompt_value "NFS_PATH" "Enter exported NAS media path (e.g., /volume1/media)" "" 1
-
-    if [[ "${NFS_PATH}" != /* ]]; then
-        log_error "NFS_PATH ('${NFS_PATH}') must be an absolute path starting with '/'."
-        return 1
-    fi
-    if [[ "${#NFS_PATH}" -gt 1 ]]; then
-        NFS_PATH="${NFS_PATH%/}"
-    fi
-
     prompt_value "TMDB_API_KEY" "Enter TMDB API Key (v3 32-char hex key or v4 Bearer Read Access Token)" "" 1
     prompt_value "SCRATCH_DIR" "Enter local scratch directory (>= 25 GiB free required)" "/var/lib/hometheatre/scratch" 1
     prompt_value "WEB_PORT" "Enter host port for the embedded Web UI" "8080" 1
@@ -549,7 +531,7 @@ verify_scratch_dir() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. Host NFS Mount Verification, PUID/PGID Detection & Directory Initialization
+# 6. Host NFS Bind-Mount Verification, PUID/PGID Detection & Directory Init
 # ------------------------------------------------------------------------------
 is_mounted_dir() {
     local target="$1"
@@ -561,41 +543,18 @@ is_mounted_dir() {
 }
 
 verify_and_init_nfs() {
-    log_info "Resolving NFS_SERVER '${NFS_SERVER}' to IPv4 address via getent ahostsv4..."
+    log_info "Verifying host bind-mount directory (${HOST_NFS_DIR})..."
 
-    NFS_SERVER_IP=$(getent ahostsv4 "$NFS_SERVER" 2>/dev/null | awk 'NR==1 {print $1}')
-    if [[ -z "$NFS_SERVER_IP" ]]; then
-        log_error "Failed to resolve IPv4 address for NFS_SERVER '${NFS_SERVER}' via 'getent ahostsv4'."
-        log_error "Verify DNS/hosts configuration or specify the NAS IPv4 address directly in NFS_SERVER."
+    if [[ ! -d "$HOST_NFS_DIR" ]]; then
+        log_error "Host NFS directory '${HOST_NFS_DIR}' does not exist."
+        log_error "Please mount your NAS media share at '${HOST_NFS_DIR}' on the host before running ./install.sh."
         return 1
     fi
-    log_ok "Resolved ${NFS_SERVER} -> ${NFS_SERVER_IP}"
-
-    mkdir -p "$HOST_NFS_DIR"
 
     if is_mounted_dir "$HOST_NFS_DIR"; then
-        NFS_OPTS="${NFS_OPTS:-$NFS_OPTS_V4}"
-        log_ok "Host NFS directory ${HOST_NFS_DIR} is already mounted."
+        log_ok "Host NFS directory ${HOST_NFS_DIR} is mounted."
     else
-        log_info "${HOST_NFS_DIR} is not currently mounted; mounting ${NFS_SERVER_IP}:${NFS_PATH} -> ${HOST_NFS_DIR} (trying nfsvers=4 first)..."
-        if mount -t nfs -o "addr=${NFS_SERVER_IP},${NFS_OPTS_V4}" "${NFS_SERVER_IP}:${NFS_PATH}" "$HOST_NFS_DIR" 2>/dev/null; then
-            NFS_OPTS="$NFS_OPTS_V4"
-            log_ok "Mounted ${NFS_SERVER_IP}:${NFS_PATH} at ${HOST_NFS_DIR} using NFSv4 (${NFS_OPTS})."
-        else
-            log_warn "NFSv4 mount failed; falling back to NFSv3 (nfsvers=3,nolock)..."
-            if mount -t nfs -o "addr=${NFS_SERVER_IP},${NFS_OPTS_V3}" "${NFS_SERVER_IP}:${NFS_PATH}" "$HOST_NFS_DIR" 2>/dev/null; then
-                NFS_OPTS="$NFS_OPTS_V3"
-                log_ok "Mounted ${NFS_SERVER_IP}:${NFS_PATH} at ${HOST_NFS_DIR} using NFSv3 fallback (${NFS_OPTS})."
-            else
-                log_error "Failed to mount NFS share '${NFS_SERVER_IP}:${NFS_PATH}' onto '${HOST_NFS_DIR}'."
-                log_error "To mount your NAS movie/media folder on the host before running ./install.sh:"
-                log_error "  sudo mkdir -p ${HOST_NFS_DIR}"
-                log_error "  sudo mount -t nfs -o addr=${NFS_SERVER_IP},${NFS_OPTS_V4} ${NFS_SERVER_IP}:${NFS_PATH} ${HOST_NFS_DIR}"
-                log_error "Or add this line to /etc/fstab for persistent mounting across reboots:"
-                log_error "  ${NFS_SERVER_IP}:${NFS_PATH} ${HOST_NFS_DIR} nfs ${NFS_OPTS_V4},_netdev 0 0"
-                return 1
-            fi
-        fi
+        log_warn "Host directory ${HOST_NFS_DIR} is not a distinct mountpoint (using existing directory for bind mount)."
     fi
 
     local share_uid share_gid
@@ -624,15 +583,15 @@ verify_and_init_nfs() {
         bash -c "mkdir -p '$HOST_NFS_DIR/movies' '$HOST_NFS_DIR/tv' '$HOST_NFS_DIR/unidentified' && \
                  touch '$HOST_NFS_DIR/.hometheatre_write_test' && \
                  rm -f '$HOST_NFS_DIR/.hometheatre_write_test'" 2>/dev/null; then
-        log_error "Write test failed (EACCES) on '${HOST_NFS_DIR}' (${NFS_SERVER}:${NFS_PATH}) as UID:GID ${PUID}:${PGID}."
-        log_error "How to fix on your NAS:"
-        log_error "  - Ensure the NFS export '${NFS_PATH}' grants Read/Write (rw) access to this host."
-        log_error "  - Ensure filesystem permissions on '${NFS_PATH}' allow writes by UID:GID ${PUID}:${PGID} (detected share owner: ${share_uid}:${share_gid})."
+        log_error "Write test failed (EACCES) on '${HOST_NFS_DIR}' as UID:GID ${PUID}:${PGID}."
+        log_error "How to fix:"
+        log_error "  - Ensure the NAS NFS export mounted at '${HOST_NFS_DIR}' grants Read/Write (rw) access to this host."
+        log_error "  - Ensure filesystem permissions on '${HOST_NFS_DIR}' allow writes by UID:GID ${PUID}:${PGID} (detected share owner: ${share_uid}:${share_gid})."
         log_error "  - If using Squash All Users / Map to Guest on Synology/QNAP/TrueNAS, ensure the mapped guest user has write permissions, or set PUID=${share_uid} PGID=${share_gid} in ${ENV_FILE}."
         return 1
     fi
 
-    log_ok "Verified NFS write access on ${HOST_NFS_DIR} (PUID=${PUID}, PGID=${PGID}) and initialized movies/, tv/, and unidentified/ directories."
+    log_ok "Verified write access on ${HOST_NFS_DIR} (PUID=${PUID}, PGID=${PGID}) and initialized movies/, tv/, and unidentified/ directories."
 }
 
 # ------------------------------------------------------------------------------
@@ -689,14 +648,8 @@ OPTICAL_SR_DEVICE=${OPTICAL_SR_DEVICE}
 OPTICAL_SG_DEVICE=${OPTICAL_SG_DEVICE}
 CDROM_GID=${CDROM_GID}
 
-# Host NFS Mount & NAS Configuration
+# Host NFS Bind Mount & File Ownership (auto-detected from HOST_NFS_DIR by install.sh)
 HOST_NFS_DIR=${HOST_NFS_DIR}
-NFS_SERVER=${NFS_SERVER}
-NFS_SERVER_IP=${NFS_SERVER_IP}
-NFS_PATH=${NFS_PATH}
-NFS_OPTS=${NFS_OPTS}
-
-# NFS File Ownership (auto-detected from NFS share by install.sh)
 PUID=${PUID}
 PGID=${PGID}
 
@@ -814,25 +767,23 @@ Home Theatre Installation Complete (DevPod)!
    - Optical Drive:    ${OPTICAL_SR_DEVICE} -> /dev/sr0 (${OPTICAL_SG_DEVICE}, gid=${CDROM_GID})
    - Scratch Bind:     ${SCRATCH_DIR} -> /scratch
    - Host NFS Bind:    ${HOST_NFS_DIR} -> /mnt/nfs (PUID=${PUID}, PGID=${PGID})
-   - Persistent /etc/fstab entry for host NFS mount:
-     ${NFS_SERVER_IP}:${NFS_PATH} ${HOST_NFS_DIR} nfs ${NFS_OPTS},_netdev 0 0
 
 3. Kodi Setup Instructions (Google TV & Tablet):
    In Kodi, go to Settings -> Media -> Library -> Videos -> Add videos...
-   Add the following two NFS network sources directly:
+   Add the following two NFS network sources from your NAS export:
 
-   - Movies Source:   nfs://${NFS_SERVER}${NFS_PATH}/movies
+   - Movies Source:   nfs://<NAS_IP>/<NAS_EXPORT_PATH>/movies
      (Set content: "Movies", Scraper: "Local information only" or "TMDB")
 
-   - TV Shows Source: nfs://${NFS_SERVER}${NFS_PATH}/tv
+   - TV Shows Source: nfs://<NAS_IP>/<NAS_EXPORT_PATH>/tv
      (Set content: "TV shows", Scraper: "Local information only" or "TMDB TV Shows")
 
    IMPORTANT — NAS 'insecure' Export Requirement for Kodi on Google TV / Android:
    Standalone Kodi apps on Google TV and Android tablets use userspace libnfs,
    which connects from unprivileged source ports (> 1024). Ensure your NAS NFS
-   export for '${NFS_PATH}' enables the 'insecure' option (e.g., 'insecure' in
-   Linux /etc/exports, "Allow non-root mount" on TrueNAS, or default non-root
-   port access on Synology/QNAP) so Kodi does not receive Permission Denied.
+   export enables the 'insecure' option (e.g., 'insecure' in Linux /etc/exports,
+   "Allow non-root mount" on TrueNAS, or default non-root port access on
+   Synology/QNAP) so Kodi does not receive Permission Denied.
 ================================================================================
 EOF
 }

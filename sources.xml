@@ -14,9 +14,10 @@
          nfs://192.168.1.50/volume1/media/movies/
          nfs://192.168.1.50/volume1/media/tv/
 
-    2. Or generate a ready-to-push file directly from your host .env file:
-         set -a && source .env && set +a
-         sed -e "s|\${NFS_SERVER}|${NFS_SERVER_IP:-$NFS_SERVER}|g" \
+    2. Render a ready-to-push file with your NAS IP and export path:
+         NFS_SERVER="192.168.1.50"
+         NFS_PATH="/volume1/media"
+         sed -e "s|\${NFS_SERVER}|${NFS_SERVER}|g" \
              -e "s|\${NFS_PATH}|${NFS_PATH%/}|g" \
              sources.xml > sources.kodi.xml
 

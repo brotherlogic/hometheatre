@@ -102,11 +102,10 @@ flowchart TD
 
 ### 4.1 Installer Script (`install.sh`)
 An idempotent Bash installer script targeting Linux hosts with DevPod that:
-1. Checks host prerequisites (`devpod` / `devpod-cli`, `nfs-common`, `dnsutils`, `util-linux`, `lsscsi`, `udev`, `curl`).
+1. Checks host prerequisites (`devpod` / `devpod-cli`, `util-linux`, `lsscsi`, `udev`, `curl`).
 2. Loads and persists the `sg` kernel module (`modprobe sg` + `/etc/modules-load.d/hometheatre-sg.conf`), detects attached optical drives (`/dev/sr*` and corresponding generic SCSI `/dev/sg*` devices via `sysfs`), and verifies device permissions.
 3. Prompts for (or reads from `.env`) configuration values:
-   - `HOST_NFS_DIR` (default `/mnt/nfs`, bind-mounted into the DevPod daemon container at `/mnt/nfs`)
-   - `NFS_SERVER` and `NFS_PATH` (resolves `NFS_SERVER_IP`, verifies or mounts `HOST_NFS_DIR` using `nfsvers=4` vs `nfsvers=3,nolock`, auto-detects `PUID`/`PGID`, and tests write access via `setpriv`)
+   - `HOST_NFS_DIR` (default `/mnt/nfs`, bind-mounted into the DevPod daemon container at `/mnt/nfs`; auto-detects `PUID`/`PGID` and tests write access via `setpriv`)
    - `TMDB_API_KEY` (validates v3 API key or v4 Bearer token against TMDB API)
    - `SCRATCH_DIR` (verifies at least **`25 GiB`** free local disk space)
    - `WEB_PORT` (default e.g. `8080`)
@@ -114,7 +113,7 @@ An idempotent Bash installer script targeting Linux hosts with DevPod that:
    - `DAEMON_WORKSPACE_ID` (default `hometheatre-daemon`, distinct from the `hometheatre` development container)
 4. Initializes the required folder structure on the NFS share (`movies/`, `tv/`, `unidentified/`).
 5. Renders `deploy/devcontainer.json` with the configured host bind mounts and device passthrough, then builds and starts the standalone DevPod daemon workspace (`devpod up . --id hometheatre-daemon --devcontainer-path deploy/devcontainer.json --ide none --recreate`).
-6. Outputs a summary with the local Web UI URL, `/etc/fstab` host mount line, and exact NFS paths (plus `insecure` export reminder) to enter into Kodi on Google TV and the tablet.
+6. Outputs a summary with the local Web UI URL and Kodi NFS setup instructions (plus `insecure` export reminder) for Google TV and the tablet.
 
 ---
 

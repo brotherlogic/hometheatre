@@ -62,14 +62,8 @@ OPTICAL_SR_DEVICE=/dev/sr0
 OPTICAL_SG_DEVICE=/dev/sg1
 CDROM_GID=24
 
-# Host NFS Mount & NAS Configuration
+# Host NFS Bind Mount & File Ownership (auto-detected from HOST_NFS_DIR by install.sh)
 HOST_NFS_DIR=/mnt/nfs
-NFS_SERVER=nas.local
-NFS_SERVER_IP=192.168.1.50
-NFS_PATH=/volume1/media
-NFS_OPTS=rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime
-
-# NFS File Ownership (auto-detected from NFS share by install.sh)
 PUID=1000
 PGID=1000
 
@@ -85,25 +79,25 @@ DAEMON_WORKSPACE_ID=hometheatre-daemon
 
 ---
 
-## 2. Host NFS Mount Instructions & Mount Options (`HOST_NFS_DIR` & `NFS_OPTS`)
+## 2. Host NFS Mount Instructions & Mount Options (`HOST_NFS_DIR`)
 
 ### 2.1 Mounting the NAS Media Folder on the Host at `/mnt/nfs`
-Because DevPod uses standard DevContainer bind mounts (`type=bind`) rather than Docker Compose named volume plugins, the NAS media export is mounted on the **host** at a known path (`HOST_NFS_DIR`, default `/mnt/nfs`) and bind-mounted into the `hometheatre-daemon` container at `/mnt/nfs`.
+Because DevPod uses standard DevContainer bind mounts (`type=bind`), the NAS media export is mounted on the **host** at a known path (`HOST_NFS_DIR`, default `/mnt/nfs`) and bind-mounted into the `hometheatre-daemon` container at `/mnt/nfs`. Neither the container nor `install.sh` needs the NAS hostname or export path configured.
 
 1. **Create the Host Mount Directory:**
    ```bash
    sudo mkdir -p /mnt/nfs
    ```
-2. **Mount Immediately on the Host (or let `sudo ./install.sh` mount it):**
+2. **Mount on the Host:**
    ```bash
    sudo mount -t nfs \
      -o rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime \
-     <NFS_SERVER_IP>:<NFS_PATH> /mnt/nfs
+     <NAS_IP>:<NAS_EXPORT_PATH> /mnt/nfs
    ```
 3. **Persist Across Host Reboots (`/etc/fstab`):**
    Add the following line to `/etc/fstab` on your host:
    ```fstab
-   <NFS_SERVER_IP>:<NFS_PATH> /mnt/nfs nfs rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime,_netdev 0 0
+   <NAS_IP>:<NAS_EXPORT_PATH> /mnt/nfs nfs rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime,_netdev 0 0
    ```
 
 ### 2.2 Why `hard` (and Never `soft`) for Multi-Gigabyte `.iso` Transfers
@@ -116,55 +110,33 @@ Transferring a `4.7 GB` (`DVD-5`) or `8.5 GB` (`DVD-9`) `.iso` from local scratc
   - Setting `1 MiB` (`1,048,576` bytes) read/write block sizes maximizes sequential throughput for multi-gigabyte `.iso` writes (the kernel automatically negotiates down to the NAS server's maximum supported payload if smaller).
   - `noatime` suppresses redundant metadata RPC round-trips when reading `.probe.json` sidecars or verifying written files.
 
-### 2.3 Auto-Negotiating `nfsvers=4` vs. `nfsvers=3,nolock` in `install.sh`
-If `HOST_NFS_DIR` is not already mounted when `install.sh` runs, `install.sh` automatically mounts the NAS share onto `HOST_NFS_DIR`:
-1. **Primary Probe (`nfsvers=4`):**
-   ```text
-   rw,nfsvers=4,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime
-   ```
-   Preferred on modern NAS appliances (Synology, TrueNAS, Unraid, QNAP, Linux `nfs-kernel-server`) because NFSv4 uses a single TCP port (`2049`) and integrated stateful locking without requiring `rpcbind` (`portmapper`) or `rpc.statd`.
-2. **Fallback Probe (`nfsvers=3,nolock`):**
-   ```text
-   rw,nfsvers=3,nolock,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime
-   ```
-   Used automatically if the NAS share is exported exclusively for NFSv3 (common on older NAS setups configured specifically for Kodi's built-in `libnfs` client). `nolock` is included for NFSv3 so file locks remain local to the single writer container without requiring `rpc.statd`/`lockd` firewall ports on the host or NAS.
-
-### 2.4 NAS Export Requirement for Standalone Kodi Clients on Google TV & Tablets (`insecure` / Non-Root Ports)
+### 2.3 NAS Export Requirement for Standalone Kodi Clients on Google TV & Tablets (`insecure` / Non-Root Ports)
 While the Linux host mounts the NAS export using the in-kernel NFS client (which binds privileged source ports `< 1024`), standalone **Kodi apps on Google TV and Android tablets** use Kodi's built-in userspace `libnfs` library, which runs as an unprivileged Android app and connects from unprivileged source ports (`> 1024`).
 - On Linux `nfs-kernel-server`, TrueNAS, and Unraid, the NAS NFS export **must include the `insecure` option** (allowing NFS requests from ports `> 1024`), and on Synology/QNAP, default non-privileged port access must remain enabled.
-- Without `insecure` on the NAS export, the Linux host and DevPod container will write to the NFS share cleanly, **but Kodi on Google TV/tablets will receive `Permission Denied` when browsing `nfs://<NFS_SERVER>/<NFS_PATH>`**.
+- Without `insecure` on the NAS export, the Linux host and DevPod container will write to the NFS share cleanly, **but Kodi on Google TV/tablets will receive `Permission Denied` when browsing the NAS export**.
 - `install.sh` explicitly highlights this requirement in its final Kodi onboarding summary.
 
 ---
 
 ## 3. Host Pre-Flight Checks & DevPod Deployment in `install.sh`
 
-### 3.1 Prerequisite Verification (`devpod` + Host NFS Tools)
-`install.sh` verifies that `devpod` (or `devpod-cli`) is installed and available on the host, and on Debian/Ubuntu hosts ensures `nfs-common`, `dnsutils`, `util-linux`, `lsscsi`, `udev`, and `curl` are installed.
+### 3.1 Prerequisite Verification (`devpod` + Host Tools)
+`install.sh` verifies that `devpod` (or `devpod-cli`) is installed and available on the host, and on Debian/Ubuntu hosts ensures `util-linux`, `lsscsi`, `udev`, and `curl` are installed.
 
-### 3.2 Resolving `NFS_SERVER` to `NFS_SERVER_IP`
-- `install.sh` accepts either a hostname (`nas.local`) or an IP address (`192.168.1.50`) for `NFS_SERVER`.
-- It resolves the IPv4 address via `getent ahostsv4 "$NFS_SERVER" | awk 'NR==1 {print $1}'` and saves:
-  - `NFS_SERVER`: Preserved for human-readable output and Kodi source instructions (`nfs://<NFS_SERVER><NFS_PATH>/movies`).
-  - `NFS_SERVER_IP`: Used for the host mount and printed in the `/etc/fstab` instructions.
-
-### 3.3 Host Mount Verification, `root_squash` Detection, & Directory Initialization
+### 3.2 Host Bind-Mount Verification, `root_squash` Detection, & Directory Initialization
 During `install.sh`, before launching the DevPod daemon container:
 
 ```mermaid
 flowchart TD
-    A["Resolve NFS_SERVER -> NFS_SERVER_IP"] --> B{"Is HOST_NFS_DIR (/mnt/nfs) Already Mounted?"}
-    B -- "Yes" --> G["Inspect Share Owner UID:GID via stat -c '%u:%g'\nDefault PUID/PGID to Share Owner (or SUDO_UID/GID if 0:0)"]
-    B -- "No" --> C{"Mount at HOST_NFS_DIR with nfsvers=4\n(Fallback nfsvers=3,nolock)"}
-    C -- "Success" --> G
-    C -- "Fail" --> F["Abort with Exact Host mount & /etc/fstab Instructions"]
+    B{"Does HOST_NFS_DIR (/mnt/nfs) Exist?"} -- "Yes" --> G["Inspect Share Owner UID:GID via stat -c '%u:%g'\nDefault PUID/PGID to Share Owner (or SUDO_UID/GID if 0:0)"]
+    B -- "No" --> F["Abort with Host Mount Instructions"]
     G --> H{"Test Write & mkdir as PUID:PGID\n(setpriv --reuid=$PUID --regid=$PGID)"}
     H -- "Success" --> I["Create /movies, /tv, /unidentified on HOST_NFS_DIR\nRender deploy/devcontainer.json & Run devpod up"]
-    H -- "Fail (EACCES)" --> J["Abort with Exact NAS Permission Fix Instructions"]
+    H -- "Fail (EACCES)" --> J["Abort with NAS Permission Fix Instructions"]
 ```
 
 1. **Auto-Detecting `PUID` and `PGID`:**
-   - Once mounted at `$HOST_NFS_DIR`, `install.sh` inspects the share's ownership:
+   - `install.sh` inspects the ownership of `$HOST_NFS_DIR`:
      ```bash
      SHARE_UID=$(stat -c '%u' "$HOST_NFS_DIR")
      SHARE_GID=$(stat -c '%g' "$HOST_NFS_DIR")
@@ -182,7 +154,7 @@ flowchart TD
      ```
    - If this succeeds, `install.sh` confirms that both the NFS export ACL and filesystem permissions for `PUID:PGID` are valid—even when `root_squash` is active on the NAS.
 
-### 3.4 Rendering `deploy/devcontainer.json` & Launching the DevPod Daemon Workspace
+### 3.3 Rendering `deploy/devcontainer.json` & Launching the DevPod Daemon Workspace
 To make `install.sh` 100% idempotent across configuration changes:
 1. `install.sh` writes the validated `.env` file and renders `deploy/devcontainer.json` with the exact host device paths (`OPTICAL_SR_DEVICE`, `OPTICAL_SG_DEVICE`, `CDROM_GID`) and host bind mounts (`source=${SCRATCH_DIR},target=/scratch,type=bind` and `source=${HOST_NFS_DIR},target=/mnt/nfs,type=bind`).
 2. `install.sh` invokes DevPod to build and recreate the standalone daemon workspace (`hometheatre-daemon`):
