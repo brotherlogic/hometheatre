@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ==============================================================================
+  Home Theatre: Kodi NFS Media Sources Configuration Template (sources.xml)
+  ==============================================================================
+  Target path on Google TV / Android Tablet:
+    /sdcard/Android/data/org.xbmc.kodi/files/.kodi/userdata/sources.xml
+
+  Usage:
+    1. Replace ${NFS_SERVER} (preferably with your NAS static IPv4 address, e.g.,
+       192.168.1.50, or LAN hostname) and ${NFS_PATH} (e.g., /volume1/media).
+       Note: ${NFS_PATH} starts with a leading slash (e.g., /volume1/media).
+       Example resolved URLs:
+         nfs://192.168.1.50/volume1/media/movies/
+         nfs://192.168.1.50/volume1/media/tv/
+
+    2. Or generate a ready-to-push file directly from your host .env file:
+         set -a && source .env && set +a
+         sed -e "s|\${NFS_SERVER}|${NFS_SERVER_IP:-$NFS_SERVER}|g" \
+             -e "s|\${NFS_PATH}|${NFS_PATH%/}|g" \
+             sources.xml > sources.kodi.xml
+
+    3. Push to Google TV or Android tablet over ADB:
+         adb push sources.kodi.xml /sdcard/Android/data/org.xbmc.kodi/files/.kodi/userdata/sources.xml
+
+  IMPORTANT:
+    - The NAS NFS export for ${NFS_PATH} MUST allow unprivileged source ports
+      (> 1024) via the 'insecure' export option (or "Allow non-root mount" on
+      TrueNAS) so Kodi's userspace libnfs client on Android/Google TV can mount
+      the share without receiving Permission Denied.
+    - The /unidentified directory is intentionally excluded from <video> sources
+      so unconfirmed rips waiting in the Web UI queue are never scanned into the
+      Kodi library before tagging.
+    - See KODI.md for full library scraper and DVD ISO playback configuration.
+  ==============================================================================
+-->
+<sources>
+    <programs>
+        <default pathversion="1"></default>
+    </programs>
+    <video>
+        <default pathversion="1"></default>
+        <source>
+            <name>Movies</name>
+            <path pathversion="1">nfs://${NFS_SERVER}${NFS_PATH}/movies/</path>
+            <allowsharing>true</allowsharing>
+        </source>
+        <source>
+            <name>TV Shows</name>
+            <path pathversion="1">nfs://${NFS_SERVER}${NFS_PATH}/tv/</path>
+            <allowsharing>true</allowsharing>
+        </source>
+    </video>
+    <music>
+        <default pathversion="1"></default>
+    </music>
+    <pictures>
+        <default pathversion="1"></default>
+    </pictures>
+    <files>
+        <default pathversion="1"></default>
+        <source>
+            <name>HomeTheatre NAS</name>
+            <path pathversion="1">nfs://${NFS_SERVER}${NFS_PATH}/</path>
+            <allowsharing>true</allowsharing>
+        </source>
+    </files>
+    <games>
+        <default pathversion="1"></default>
+    </games>
+</sources>
