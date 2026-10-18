@@ -1,0 +1,36 @@
+{
+	"name": "Home Theatre Daemon",
+	"build": {
+		"dockerfile": "../Dockerfile",
+		"context": ".."
+	},
+	"workspaceFolder": "/workspaces/hometheatre",
+	"remoteUser": "root",
+	"capAdd": [
+		"SYS_RAWIO"
+	],
+	"runArgs": [
+		"--security-opt",
+		"label=disable",
+		"--network=host",
+		"--device=/dev/sr0:/dev/sr0",
+		"--device=/dev/sg0:/dev/sg0",
+		"--group-add=24",
+		"--env-file",
+		"${localWorkspaceFolder}/.env"
+	],
+	"mounts": [
+		"source=/var/lib/hometheatre/scratch,target=/scratch,type=bind",
+		"source=/mnt/nfs,target=/mnt/nfs,type=bind"
+	],
+	"containerEnv": {
+		"OPTICAL_DEVICE": "/dev/sr0",
+		"CONTAINER_OPTICAL_DEVICE": "/dev/sr0",
+		"CONTAINER_SCRATCH_DIR": "/scratch",
+		"CONTAINER_NFS_ROOT": "/mnt/nfs",
+		"DVDCSS_METHOD": "key",
+		"DVDCSS_CACHE": "/scratch/.dvdcss",
+		"DVDCSS_VERBOSE": "1"
+	},
+	"postStartCommand": "/usr/local/bin/start-daemon.sh"
+}

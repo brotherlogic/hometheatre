@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Home Theatre: Idempotent Debian/Ubuntu Host Installer (install.sh)
+# Home Theatre: Idempotent Linux Host Installer for DevPod (install.sh)
 # ==============================================================================
 # Responsibilities (per INTENT.md 4.1, DRIVE.md 3, METADATA.md 3.4, DOCKER.md 3):
-# 1. Check and install host prerequisites (docker.io / docker-ce,
-#    docker-compose-plugin, nfs-common, dnsutils, util-linux, lsscsi, udev, curl).
+# 1. Check host prerequisites (devpod / devpod-cli, nfs-common / mount.nfs,
+#    dnsutils / getent, util-linux / setpriv, lsscsi, udev, curl).
 # 2. Load and persist the generic SCSI kernel module (modprobe sg +
 #    /etc/modules-load.d/hometheatre-sg.conf).
 # 3. Auto-detect physical optical drives via sysfs (/sys/class/block/sr* and
 #    /device/scsi_generic/sg*), handling 0, 1, or multiple drives cleanly.
-# 4. Prompt for or validate .env configuration (NFS_SERVER, NFS_PATH,
-#    TMDB_API_KEY, SCRATCH_DIR, WEB_PORT, optional WEBHOOK_URL).
+# 4. Prompt for or validate .env configuration (HOST_NFS_DIR, NFS_SERVER,
+#    NFS_PATH, TMDB_API_KEY, SCRATCH_DIR, WEB_PORT, optional WEBHOOK_URL,
+#    DAEMON_WORKSPACE_ID).
 # 5. Verify SCRATCH_DIR has at least 25 GiB (26,843,545,600 bytes) of free space.
-# 6. Resolve NFS_SERVER -> NFS_SERVER_IP via getent ahostsv4, auto-probe
-#    nfsvers=4 (fallback nfsvers=3,nolock), auto-detect share owner PUID/PGID,
-#    and test root_squash-compatible write access via setpriv to initialize
-#    movies/, tv/, and unidentified/.
+# 6. Resolve NFS_SERVER -> NFS_SERVER_IP via getent ahostsv4, ensure or mount
+#    the NAS share on the host at HOST_NFS_DIR (default /mnt/nfs), auto-detect
+#    share owner PUID/PGID, and test root_squash-compatible write access via
+#    setpriv to initialize movies/, tv/, and unidentified/.
 # 7. Validate TMDB_API_KEY against the TMDB API (v3 ?api_key= & v4 Bearer eyJ...).
-# 8. Recreate the hometheatre_nfs_media Docker volume wrapper if NFS options
-#    changed, build & launch the Docker Compose stack, and print the Web UI URL
-#    + Kodi NFS setup instructions (including the 'insecure' export requirement).
+# 8. Render deploy/devcontainer.json with host bind mounts (SCRATCH_DIR -> /scratch,
+#    HOST_NFS_DIR -> /mnt/nfs) and optical device passthrough, then build & launch
+#    the standalone DevPod daemon workspace (hometheatre-daemon), completely
+#    separate from the development devcontainer.
 # ==============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env}"
-COMPOSE_FILE="${COMPOSE_FILE:-${SCRIPT_DIR}/docker-compose.yml}"
+DEPLOY_DEVCONTAINER_FILE="${DEPLOY_DEVCONTAINER_FILE:-${SCRIPT_DIR}/deploy/devcontainer.json}"
 SYSFS_BLOCK_DIR="${SYSFS_BLOCK_DIR:-/sys/class/block}"
 DEV_DIR="${DEV_DIR:-/dev}"
 MODULES_LOAD_CONF="${MODULES_LOAD_CONF:-/etc/modules-load.d/hometheatre-sg.conf}"
@@ -45,7 +47,7 @@ EXPLICIT_OPTICAL_SR=0
 EXPLICIT_OPTICAL_SG=0
 EXPLICIT_PUID=0
 EXPLICIT_PGID=0
-TMP_MNT=""
+DEVPOD_BIN=""
 
 # ------------------------------------------------------------------------------
 # Logging Helpers
@@ -65,16 +67,6 @@ log_warn() {
 log_error() {
     printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2
 }
-
-cleanup_tmp_mount() {
-    if [[ -n "${TMP_MNT:-}" ]]; then
-        umount -lf "$TMP_MNT" 2>/dev/null || true
-        rmdir "$TMP_MNT" 2>/dev/null || true
-        TMP_MNT=""
-    fi
-}
-
-trap cleanup_tmp_mount EXIT
 
 usage() {
     cat <<EOF
@@ -116,7 +108,7 @@ is_interactive() {
 }
 
 # ------------------------------------------------------------------------------
-# 1. Root & Prerequisite Package Checks
+# 1. Root & Prerequisite Checks (DevPod + Host Tools)
 # ------------------------------------------------------------------------------
 check_root() {
     if [[ "${HOMETHEATRE_SKIP_ROOT_CHECK:-0}" == "1" ]]; then
@@ -128,96 +120,85 @@ check_root() {
     fi
 }
 
-check_os_release() {
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" && "${ID_LIKE:-}" != *"debian"* ]]; then
-            log_warn "Detected OS '${PRETTY_NAME:-${ID:-unknown}}'. This script targets Debian/Ubuntu hosts."
-        fi
-    fi
-}
-
 pkg_installed() {
     dpkg -s "$1" >/dev/null 2>&1
 }
 
-pkg_candidate_exists() {
-    local candidate
-    candidate=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2}')
-    [[ -n "$candidate" && "$candidate" != "(none)" ]]
+resolve_devpod_bin() {
+    if [[ -n "${DEVPOD_CLI:-}" ]] && command -v "${DEVPOD_CLI}" >/dev/null 2>&1; then
+        DEVPOD_BIN="$(command -v "${DEVPOD_CLI}")"
+        return 0
+    fi
+    if command -v devpod >/dev/null 2>&1; then
+        DEVPOD_BIN="$(command -v devpod)"
+        return 0
+    fi
+    if command -v devpod-cli >/dev/null 2>&1; then
+        DEVPOD_BIN="$(command -v devpod-cli)"
+        return 0
+    fi
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local user_home
+        user_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+        if [[ -n "$user_home" ]]; then
+            for candidate in "$user_home/.local/bin/devpod" "$user_home/.local/bin/devpod-cli" "$user_home/bin/devpod"; do
+                if [[ -x "$candidate" ]]; then
+                    DEVPOD_BIN="$candidate"
+                    return 0
+                fi
+            done
+        fi
+    fi
+    return 1
+}
+
+run_devpod() {
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        local user_home
+        user_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+        if [[ -n "$user_home" && -d "$user_home/.devpod" ]]; then
+            sudo -u "$SUDO_USER" HOME="$user_home" "$DEVPOD_BIN" "$@"
+            return $?
+        fi
+    fi
+    "$DEVPOD_BIN" "$@"
 }
 
 install_prerequisites() {
-    log_info "Checking Debian/Ubuntu host prerequisites..."
+    log_info "Checking host prerequisites and DevPod CLI..."
 
-    local base_pkgs=(
-        nfs-common
-        dnsutils
-        util-linux
-        lsscsi
-        udev
-        curl
-    )
-    local missing_pkgs=()
-    local need_docker=0
-    local need_compose=0
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v apt-get >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+        local base_pkgs=(
+            nfs-common
+            dnsutils
+            util-linux
+            lsscsi
+            udev
+            curl
+        )
+        local missing_pkgs=()
 
-    for pkg in "${base_pkgs[@]}"; do
-        if ! pkg_installed "$pkg"; then
-            missing_pkgs+=("$pkg")
-        fi
-    done
-
-    if ! command -v docker >/dev/null 2>&1; then
-        need_docker=1
-    fi
-
-    if ! docker compose version >/dev/null 2>&1; then
-        need_compose=1
-    fi
-
-    if [[ "${#missing_pkgs[@]}" -gt 0 || "$need_docker" -eq 1 || "$need_compose" -eq 1 ]]; then
-        log_info "Updating apt package index..."
-        apt-get update -qq
-
-        if [[ "$need_docker" -eq 1 ]]; then
-            if pkg_candidate_exists docker-ce; then
-                missing_pkgs+=("docker-ce")
-            else
-                missing_pkgs+=("docker.io")
+        for pkg in "${base_pkgs[@]}"; do
+            if ! pkg_installed "$pkg"; then
+                missing_pkgs+=("$pkg")
             fi
-        fi
+        done
 
-        if [[ "$need_compose" -eq 1 ]]; then
-            if pkg_candidate_exists docker-compose-plugin; then
-                missing_pkgs+=("docker-compose-plugin")
-            elif pkg_candidate_exists docker-compose-v2; then
-                missing_pkgs+=("docker-compose-v2")
-            else
-                missing_pkgs+=("docker-compose-plugin")
-            fi
+        if [[ "${#missing_pkgs[@]}" -gt 0 ]]; then
+            log_info "Updating apt package index..."
+            apt-get update -qq
+            log_info "Installing missing host packages: ${missing_pkgs[*]}"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_pkgs[@]}"
         fi
-
-        log_info "Installing missing host packages: ${missing_pkgs[*]}"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_pkgs[@]}"
     fi
 
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-        systemctl enable --now docker >/dev/null 2>&1 || true
-    fi
-
-    if ! command -v docker >/dev/null 2>&1; then
-        log_error "Docker CLI is not available after package installation."
+    if ! resolve_devpod_bin; then
+        log_error "DevPod CLI ('devpod' or 'devpod-cli') was not found in PATH."
+        log_error "Please install DevPod on this host (https://devpod.sh/docs/getting-started/install) or set DEVPOD_CLI=/path/to/devpod."
         return 1
     fi
 
-    if ! docker compose version >/dev/null 2>&1; then
-        log_error "'docker compose' plugin is not available. Please install docker-compose-plugin."
-        return 1
-    fi
-
-    log_ok "All required host packages are installed (docker, docker compose, nfs-common, dnsutils, util-linux, lsscsi, udev, curl)."
+    log_ok "Host prerequisites verified (DevPod CLI: ${DEVPOD_BIN})."
 }
 
 # ------------------------------------------------------------------------------
@@ -297,7 +278,6 @@ configure_optical_drive() {
         IFS='|' read -r OPTICAL_SR_DEVICE OPTICAL_SG_DEVICE drive_label <<< "${drives[0]}"
         log_ok "Detected optical drive: ${drive_label} (${OPTICAL_SR_DEVICE} -> ${OPTICAL_SG_DEVICE})"
     elif [[ "$count" -gt 1 ]]; then
-        # Check if .env already explicitly selected one of the discovered drives
         local matched=0
         if [[ "$RECONFIGURE" -eq 0 && "$EXPLICIT_OPTICAL_SR" -eq 1 && "$EXPLICIT_OPTICAL_SG" -eq 1 ]]; then
             for entry in "${drives[@]}"; do
@@ -336,7 +316,6 @@ configure_optical_drive() {
             done
         fi
     else
-        # 0 drives detected via sysfs
         if [[ "$EXPLICIT_OPTICAL_SR" -eq 1 && "$EXPLICIT_OPTICAL_SG" -eq 1 && -n "${OPTICAL_SR_DEVICE:-}" && -n "${OPTICAL_SG_DEVICE:-}" ]]; then
             log_warn "No physical optical drive detected in ${SYSFS_BLOCK_DIR}/sr*, using explicit override from .env (${OPTICAL_SR_DEVICE} + ${OPTICAL_SG_DEVICE})."
         else
@@ -346,7 +325,6 @@ configure_optical_drive() {
         fi
     fi
 
-    # Detect CDROM_GID and verify device node permissions
     local detected_gid=""
     if [[ -e "$OPTICAL_SR_DEVICE" ]]; then
         detected_gid=$(stat -c '%g' "$OPTICAL_SR_DEVICE" 2>/dev/null || true)
@@ -370,7 +348,6 @@ configure_optical_drive() {
 # 4. Load & Prompt/Validate .env Configuration
 # ------------------------------------------------------------------------------
 load_env_file() {
-    # Track explicit environment overrides passed on invocation
     [[ -n "${OPTICAL_SR_DEVICE:-}" ]] && EXPLICIT_OPTICAL_SR=1
     [[ -n "${OPTICAL_SG_DEVICE:-}" ]] && EXPLICIT_OPTICAL_SG=1
     [[ -n "${PUID:-}" ]] && EXPLICIT_PUID=1
@@ -391,7 +368,6 @@ load_env_file() {
 
     local line key val
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Strip leading/trailing whitespace
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" || "$line" == \#* ]] && continue
@@ -400,7 +376,6 @@ load_env_file() {
             key="${BASH_REMATCH[1]}"
             val="${BASH_REMATCH[2]}"
 
-            # Strip matching surrounding double or single quotes
             if [[ "$val" =~ ^\"(.*)\"$ ]]; then
                 val="${BASH_REMATCH[1]}"
             elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
@@ -432,7 +407,7 @@ load_env_file() {
                         EXPLICIT_PGID=1
                     fi
                     ;;
-                CDROM_GID|NFS_SERVER|NFS_SERVER_IP|NFS_PATH|NFS_OPTS|SCRATCH_DIR|TMDB_API_KEY|WEB_PORT|WEBHOOK_URL)
+                CDROM_GID|HOST_NFS_DIR|NFS_SERVER|NFS_SERVER_IP|NFS_PATH|NFS_OPTS|SCRATCH_DIR|TMDB_API_KEY|WEB_PORT|WEBHOOK_URL|DAEMON_WORKSPACE_ID)
                     if [[ -z "${!key:-}" ]]; then
                         printf -v "$key" '%s' "$val"
                     fi
@@ -441,8 +416,6 @@ load_env_file() {
         fi
     done < "$ENV_FILE"
 
-    # If .env still has the placeholder TMDB_API_KEY from .env.example, treat it as an
-    # unconfigured template copy so hardware & PUID/PGID are auto-detected and prompts run.
     if [[ "${TMDB_API_KEY:-}" == "your_tmdb_api_key_here" ]]; then
         TMDB_API_KEY=""
         EXPLICIT_OPTICAL_SR="$env_sr"
@@ -493,15 +466,22 @@ prompt_value() {
 prompt_and_validate_config() {
     log_info "Validating configuration values..."
 
-    # Treat placeholder TMDB key from .env.example as unset
     if [[ "${TMDB_API_KEY:-}" == "your_tmdb_api_key_here" ]]; then
         TMDB_API_KEY=""
+    fi
+
+    prompt_value "HOST_NFS_DIR" "Enter host directory where the NAS media share is mounted (bind-mounted to /mnt/nfs)" "/mnt/nfs" 1
+    if [[ "${HOST_NFS_DIR}" != /* ]]; then
+        log_error "HOST_NFS_DIR ('${HOST_NFS_DIR}') must be an absolute path starting with '/'."
+        return 1
+    fi
+    if [[ "${#HOST_NFS_DIR}" -gt 1 ]]; then
+        HOST_NFS_DIR="${HOST_NFS_DIR%/}"
     fi
 
     prompt_value "NFS_SERVER" "Enter NAS NFS server hostname or IP (e.g., nas.local or 192.168.1.50)" "" 1
     prompt_value "NFS_PATH" "Enter exported NAS media path (e.g., /volume1/media)" "" 1
 
-    # Normalize NFS_PATH (must start with /, strip trailing / unless root /)
     if [[ "${NFS_PATH}" != /* ]]; then
         log_error "NFS_PATH ('${NFS_PATH}') must be an absolute path starting with '/'."
         return 1
@@ -529,6 +509,8 @@ prompt_and_validate_config() {
         log_error "Invalid WEBHOOK_URL '${WEBHOOK_URL}'. Must start with http:// or https:// (or be empty)."
         return 1
     fi
+
+    DAEMON_WORKSPACE_ID="${DAEMON_WORKSPACE_ID:-hometheatre-daemon}"
 }
 
 # ------------------------------------------------------------------------------
@@ -567,8 +549,17 @@ verify_scratch_dir() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. NFS Server Resolution, Version Probing, PUID/PGID & Write Verification
+# 6. Host NFS Mount Verification, PUID/PGID Detection & Directory Initialization
 # ------------------------------------------------------------------------------
+is_mounted_dir() {
+    local target="$1"
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$target" 2>/dev/null
+        return $?
+    fi
+    awk -v dir="$target" '$2 == dir {found=1} END {exit !found}' /proc/mounts 2>/dev/null
+}
+
 verify_and_init_nfs() {
     log_info "Resolving NFS_SERVER '${NFS_SERVER}' to IPv4 address via getent ahostsv4..."
 
@@ -580,32 +571,36 @@ verify_and_init_nfs() {
     fi
     log_ok "Resolved ${NFS_SERVER} -> ${NFS_SERVER_IP}"
 
-    TMP_MNT=$(mktemp -d /tmp/hometheatre-nfs-test.XXXXXX)
+    mkdir -p "$HOST_NFS_DIR"
 
-    log_info "Probing NFS mount to ${NFS_SERVER_IP}:${NFS_PATH} (trying nfsvers=4 first)..."
-    if mount -t nfs -o "addr=${NFS_SERVER_IP},${NFS_OPTS_V4}" "${NFS_SERVER_IP}:${NFS_PATH}" "$TMP_MNT" 2>/dev/null; then
-        NFS_OPTS="$NFS_OPTS_V4"
-        log_ok "Mounted ${NFS_SERVER_IP}:${NFS_PATH} using NFSv4 (${NFS_OPTS})."
+    if is_mounted_dir "$HOST_NFS_DIR"; then
+        NFS_OPTS="${NFS_OPTS:-$NFS_OPTS_V4}"
+        log_ok "Host NFS directory ${HOST_NFS_DIR} is already mounted."
     else
-        log_warn "NFSv4 mount probe failed; falling back to NFSv3 (nfsvers=3,nolock)..."
-        if mount -t nfs -o "addr=${NFS_SERVER_IP},${NFS_OPTS_V3}" "${NFS_SERVER_IP}:${NFS_PATH}" "$TMP_MNT" 2>/dev/null; then
-            NFS_OPTS="$NFS_OPTS_V3"
-            log_ok "Mounted ${NFS_SERVER_IP}:${NFS_PATH} using NFSv3 fallback (${NFS_OPTS})."
+        log_info "${HOST_NFS_DIR} is not currently mounted; mounting ${NFS_SERVER_IP}:${NFS_PATH} -> ${HOST_NFS_DIR} (trying nfsvers=4 first)..."
+        if mount -t nfs -o "addr=${NFS_SERVER_IP},${NFS_OPTS_V4}" "${NFS_SERVER_IP}:${NFS_PATH}" "$HOST_NFS_DIR" 2>/dev/null; then
+            NFS_OPTS="$NFS_OPTS_V4"
+            log_ok "Mounted ${NFS_SERVER_IP}:${NFS_PATH} at ${HOST_NFS_DIR} using NFSv4 (${NFS_OPTS})."
         else
-            cleanup_tmp_mount
-            log_error "Failed to mount NFS share '${NFS_SERVER_IP}:${NFS_PATH}' with both nfsvers=4 and nfsvers=3,nolock."
-            log_error "Please verify:"
-            log_error "  1. The export path '${NFS_PATH}' exists and is exported on ${NFS_SERVER} (${NFS_SERVER_IP})."
-            log_error "  2. This Docker host's IP/subnet is permitted in the NAS NFS export ACL."
-            log_error "  3. Firewall rules allow TCP/UDP 2049 (and port 111/rpcbind for NFSv3)."
-            return 1
+            log_warn "NFSv4 mount failed; falling back to NFSv3 (nfsvers=3,nolock)..."
+            if mount -t nfs -o "addr=${NFS_SERVER_IP},${NFS_OPTS_V3}" "${NFS_SERVER_IP}:${NFS_PATH}" "$HOST_NFS_DIR" 2>/dev/null; then
+                NFS_OPTS="$NFS_OPTS_V3"
+                log_ok "Mounted ${NFS_SERVER_IP}:${NFS_PATH} at ${HOST_NFS_DIR} using NFSv3 fallback (${NFS_OPTS})."
+            else
+                log_error "Failed to mount NFS share '${NFS_SERVER_IP}:${NFS_PATH}' onto '${HOST_NFS_DIR}'."
+                log_error "To mount your NAS movie/media folder on the host before running ./install.sh:"
+                log_error "  sudo mkdir -p ${HOST_NFS_DIR}"
+                log_error "  sudo mount -t nfs -o addr=${NFS_SERVER_IP},${NFS_OPTS_V4} ${NFS_SERVER_IP}:${NFS_PATH} ${HOST_NFS_DIR}"
+                log_error "Or add this line to /etc/fstab for persistent mounting across reboots:"
+                log_error "  ${NFS_SERVER_IP}:${NFS_PATH} ${HOST_NFS_DIR} nfs ${NFS_OPTS_V4},_netdev 0 0"
+                return 1
+            fi
         fi
     fi
 
-    # Inspect share root UID/GID ownership
     local share_uid share_gid
-    share_uid=$(stat -c '%u' "$TMP_MNT" 2>/dev/null || echo "0")
-    share_gid=$(stat -c '%g' "$TMP_MNT" 2>/dev/null || echo "0")
+    share_uid=$(stat -c '%u' "$HOST_NFS_DIR" 2>/dev/null || echo "0")
+    share_gid=$(stat -c '%g' "$HOST_NFS_DIR" 2>/dev/null || echo "0")
 
     if [[ "$EXPLICIT_PUID" -eq 0 || -z "${PUID:-}" ]]; then
         if [[ "$share_uid" != "0" && "$share_uid" != "65534" ]]; then
@@ -623,14 +618,13 @@ verify_and_init_nfs() {
         fi
     fi
 
-    log_info "Testing root_squash-compatible write access and initializing directories as PUID=${PUID}, PGID=${PGID} (share owner is ${share_uid}:${share_gid})..."
+    log_info "Testing root_squash-compatible write access and initializing directories on ${HOST_NFS_DIR} as PUID=${PUID}, PGID=${PGID} (share owner is ${share_uid}:${share_gid})..."
 
     if ! setpriv --reuid="$PUID" --regid="$PGID" --clear-groups \
-        bash -c "mkdir -p '$TMP_MNT/movies' '$TMP_MNT/tv' '$TMP_MNT/unidentified' && \
-                 touch '$TMP_MNT/.hometheatre_write_test' && \
-                 rm -f '$TMP_MNT/.hometheatre_write_test'" 2>/dev/null; then
-        cleanup_tmp_mount
-        log_error "Write test failed (EACCES) on '${NFS_SERVER}:${NFS_PATH}' as UID:GID ${PUID}:${PGID}."
+        bash -c "mkdir -p '$HOST_NFS_DIR/movies' '$HOST_NFS_DIR/tv' '$HOST_NFS_DIR/unidentified' && \
+                 touch '$HOST_NFS_DIR/.hometheatre_write_test' && \
+                 rm -f '$HOST_NFS_DIR/.hometheatre_write_test'" 2>/dev/null; then
+        log_error "Write test failed (EACCES) on '${HOST_NFS_DIR}' (${NFS_SERVER}:${NFS_PATH}) as UID:GID ${PUID}:${PGID}."
         log_error "How to fix on your NAS:"
         log_error "  - Ensure the NFS export '${NFS_PATH}' grants Read/Write (rw) access to this host."
         log_error "  - Ensure filesystem permissions on '${NFS_PATH}' allow writes by UID:GID ${PUID}:${PGID} (detected share owner: ${share_uid}:${share_gid})."
@@ -638,8 +632,7 @@ verify_and_init_nfs() {
         return 1
     fi
 
-    cleanup_tmp_mount
-    log_ok "Verified NFS write access (PUID=${PUID}, PGID=${PGID}) and initialized movies/, tv/, and unidentified/ directories."
+    log_ok "Verified NFS write access on ${HOST_NFS_DIR} (PUID=${PUID}, PGID=${PGID}) and initialized movies/, tv/, and unidentified/ directories."
 }
 
 # ------------------------------------------------------------------------------
@@ -679,7 +672,7 @@ validate_tmdb_api_key() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. Write .env & Deploy Docker Compose Stack (Recreating NFS Volume on Change)
+# 8. Write .env, Render deploy/devcontainer.json & Launch DevPod Daemon
 # ------------------------------------------------------------------------------
 write_env_file() {
     log_info "Writing validated configuration to ${ENV_FILE}..."
@@ -696,7 +689,8 @@ OPTICAL_SR_DEVICE=${OPTICAL_SR_DEVICE}
 OPTICAL_SG_DEVICE=${OPTICAL_SG_DEVICE}
 CDROM_GID=${CDROM_GID}
 
-# NAS NFS Configuration
+# Host NFS Mount & NAS Configuration
+HOST_NFS_DIR=${HOST_NFS_DIR}
 NFS_SERVER=${NFS_SERVER}
 NFS_SERVER_IP=${NFS_SERVER_IP}
 NFS_PATH=${NFS_PATH}
@@ -709,42 +703,92 @@ PGID=${PGID}
 # Local Scratch Storage (>= 25 GiB free space required)
 SCRATCH_DIR=${SCRATCH_DIR}
 
-# Metadata & Web UI
+# Metadata, Web UI & DevPod Workspace
 TMDB_API_KEY=${TMDB_API_KEY}
 WEB_PORT=${WEB_PORT}
 WEBHOOK_URL=${WEBHOOK_URL:-}
+DAEMON_WORKSPACE_ID=${DAEMON_WORKSPACE_ID}
 EOF
 
     chmod 0600 "$tmp_env"
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        chown "${SUDO_USER}:${SUDO_GID:-$(id -g "$SUDO_USER")}" "$tmp_env" 2>/dev/null || true
+    fi
     mv "$tmp_env" "$ENV_FILE"
     log_ok "Saved configuration to ${ENV_FILE}."
 }
 
-deploy_compose_stack() {
-    log_info "Checking Docker named volume 'hometheatre_nfs_media'..."
+write_deploy_devcontainer() {
+    log_info "Updating DevPod daemon configuration at ${DEPLOY_DEVCONTAINER_FILE}..."
+    mkdir -p "$(dirname "$DEPLOY_DEVCONTAINER_FILE")"
+    local tmp_dc="${DEPLOY_DEVCONTAINER_FILE}.tmp.$$"
 
-    local expected_device=":${NFS_PATH}"
-    local expected_opts="addr=${NFS_SERVER_IP},${NFS_OPTS}"
+    cat > "$tmp_dc" <<EOF
+{
+	"name": "Home Theatre Daemon",
+	"build": {
+		"dockerfile": "../Dockerfile",
+		"context": ".."
+	},
+	"workspaceFolder": "/workspaces/hometheatre",
+	"remoteUser": "root",
+	"capAdd": [
+		"SYS_RAWIO"
+	],
+	"runArgs": [
+		"--security-opt",
+		"label=disable",
+		"--network=host",
+		"--device=${OPTICAL_SR_DEVICE}:/dev/sr0",
+		"--device=${OPTICAL_SG_DEVICE}:${OPTICAL_SG_DEVICE}",
+		"--group-add=${CDROM_GID}",
+		"--env-file",
+		"\${localWorkspaceFolder}/.env"
+	],
+	"mounts": [
+		"source=${SCRATCH_DIR},target=/scratch,type=bind",
+		"source=${HOST_NFS_DIR},target=/mnt/nfs,type=bind"
+	],
+	"containerEnv": {
+		"OPTICAL_DEVICE": "/dev/sr0",
+		"CONTAINER_OPTICAL_DEVICE": "/dev/sr0",
+		"CONTAINER_SCRATCH_DIR": "/scratch",
+		"CONTAINER_NFS_ROOT": "/mnt/nfs",
+		"DVDCSS_METHOD": "key",
+		"DVDCSS_CACHE": "/scratch/.dvdcss",
+		"DVDCSS_VERBOSE": "1"
+	},
+	"postStartCommand": "/usr/local/bin/start-daemon.sh"
+}
+EOF
 
-    if docker volume inspect hometheatre_nfs_media >/dev/null 2>&1; then
-        local current_device current_opts
-        current_device=$(docker volume inspect --format '{{index .Options "device"}}' hometheatre_nfs_media 2>/dev/null || true)
-        current_opts=$(docker volume inspect --format '{{index .Options "o"}}' hometheatre_nfs_media 2>/dev/null || true)
+    chmod 0644 "$tmp_dc"
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        chown "${SUDO_USER}:${SUDO_GID:-$(id -g "$SUDO_USER")}" "$tmp_dc" 2>/dev/null || true
+    fi
+    mv "$tmp_dc" "$DEPLOY_DEVCONTAINER_FILE"
+    log_ok "Rendered ${DEPLOY_DEVCONTAINER_FILE} with bind mounts (${SCRATCH_DIR}:/scratch, ${HOST_NFS_DIR}:/mnt/nfs)."
+}
 
-        if [[ "$current_device" != "$expected_device" || "$current_opts" != "$expected_opts" ]]; then
-            log_info "NFS volume configuration changed (device: '${current_device}' -> '${expected_device}', opts: '${current_opts}' -> '${expected_opts}')."
-            log_info "Stopping container and recreating local 'hometheatre_nfs_media' volume wrapper..."
-            docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down
-            docker volume rm -f hometheatre_nfs_media >/dev/null
-            log_ok "Removed stale 'hometheatre_nfs_media' volume metadata."
-        else
-            log_ok "Existing 'hometheatre_nfs_media' volume matches current NFS configuration."
-        fi
+deploy_devpod_daemon() {
+    write_deploy_devcontainer
+
+    local rel_devcontainer="deploy/devcontainer.json"
+    if [[ "$DEPLOY_DEVCONTAINER_FILE" != "${SCRIPT_DIR}/deploy/devcontainer.json" ]]; then
+        rel_devcontainer="$DEPLOY_DEVCONTAINER_FILE"
     fi
 
-    log_info "Building and starting the Home Theatre Docker Compose stack..."
-    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
-    log_ok "Home Theatre container is up and running."
+    log_info "Building and launching standalone DevPod daemon workspace '${DAEMON_WORKSPACE_ID}'..."
+    run_devpod up "$SCRIPT_DIR" \
+        --id "$DAEMON_WORKSPACE_ID" \
+        --devcontainer-path "$rel_devcontainer" \
+        --ide none \
+        --recreate
+
+    # Ensure background supervisor is started even if the provider skipped postStartCommand
+    run_devpod ssh "$DAEMON_WORKSPACE_ID" --command "/usr/local/bin/start-daemon.sh" >/dev/null 2>&1 || true
+
+    log_ok "Home Theatre DevPod daemon container '${DAEMON_WORKSPACE_ID}' is up and running."
 }
 
 # ------------------------------------------------------------------------------
@@ -758,17 +802,20 @@ print_summary() {
     cat <<EOF
 
 ================================================================================
-Home Theatre Installation Complete!
+Home Theatre Installation Complete (DevPod)!
 ================================================================================
 
 1. Local Web UI & Unidentified Disc Tagging Queue:
    - URL:            http://${host_ip}:${WEB_PORT}
    - Local Fallback: http://localhost:${WEB_PORT}
 
-2. Hardware & Storage Configuration:
-   - Optical Drive:  ${OPTICAL_SR_DEVICE} -> /dev/sr0 (${OPTICAL_SG_DEVICE}, gid=${CDROM_GID})
-   - Scratch Disk:   ${SCRATCH_DIR}
-   - NAS NFS Share:  ${NFS_SERVER} (${NFS_SERVER_IP}):${NFS_PATH} (PUID=${PUID}, PGID=${PGID})
+2. DevPod Daemon Container & Host Storage:
+   - DevPod Workspace: ${DAEMON_WORKSPACE_ID} (config: deploy/devcontainer.json)
+   - Optical Drive:    ${OPTICAL_SR_DEVICE} -> /dev/sr0 (${OPTICAL_SG_DEVICE}, gid=${CDROM_GID})
+   - Scratch Bind:     ${SCRATCH_DIR} -> /scratch
+   - Host NFS Bind:    ${HOST_NFS_DIR} -> /mnt/nfs (PUID=${PUID}, PGID=${PGID})
+   - Persistent /etc/fstab entry for host NFS mount:
+     ${NFS_SERVER_IP}:${NFS_PATH} ${HOST_NFS_DIR} nfs ${NFS_OPTS},_netdev 0 0
 
 3. Kodi Setup Instructions (Google TV & Tablet):
    In Kodi, go to Settings -> Media -> Library -> Videos -> Add videos...
@@ -793,7 +840,6 @@ EOF
 main() {
     parse_args "$@"
     check_root
-    check_os_release
     load_env_file
     install_prerequisites
     setup_sg_module
@@ -803,7 +849,7 @@ main() {
     verify_and_init_nfs
     validate_tmdb_api_key
     write_env_file
-    deploy_compose_stack
+    deploy_devpod_daemon
     print_summary
 }
 

@@ -55,6 +55,7 @@ RUN apt-get update && \
         genisoimage \
         libdvdread8 \
         lsdvd \
+        procps \
         util-linux && \
     rm -rf /var/lib/apt/lists/*
 
@@ -64,6 +65,32 @@ RUN dpkg -i /tmp/libdvdcss2_*.deb && rm -f /tmp/libdvdcss2_*.deb
 
 # Copy static Go binary from Stage 1
 COPY --from=go-builder /out/hometheatre /usr/local/bin/hometheatre
+
+# Create idempotent DevPod background daemon launcher with auto-restart loop
+RUN cat <<'EOF' > /usr/local/bin/start-daemon.sh && chmod 0755 /usr/local/bin/start-daemon.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+if pgrep -x hometheatre >/dev/null 2>&1; then
+    exit 0
+fi
+
+export OPTICAL_DEVICE="${CONTAINER_OPTICAL_DEVICE:-/dev/sr0}"
+export SCRATCH_DIR="${CONTAINER_SCRATCH_DIR:-/scratch}"
+export NFS_ROOT="${CONTAINER_NFS_ROOT:-/mnt/nfs}"
+export DVDCSS_METHOD="${DVDCSS_METHOD:-key}"
+export DVDCSS_CACHE="${DVDCSS_CACHE:-/scratch/.dvdcss}"
+export DVDCSS_VERBOSE="${DVDCSS_VERBOSE:-1}"
+
+nohup bash -c '
+    while true; do
+        /usr/local/bin/hometheatre >> /var/log/hometheatre.log 2>&1 || true
+        sleep 2
+    done
+' >/dev/null 2>&1 &
+EOF
+
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/hometheatre"]
 ```

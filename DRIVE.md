@@ -1,6 +1,6 @@
-# Optical Drive Detection, Non-Intrusive Polling & Docker Passthrough (`DRIVE.md`)
+# Optical Drive Detection, Non-Intrusive Polling & DevPod Passthrough (`DRIVE.md`)
 
-This document captures the technical design and verified implementation details for optical drive detection, non-intrusive disc polling in Go, Docker device passthrough, and host auto-detection in `install.sh` (resolving [Issue #2](https://github.com/brotherlogic/hometheatre/issues/2)).
+This document captures the technical design and verified implementation details for optical drive detection, non-intrusive disc polling in Go, DevPod device passthrough (`deploy/devcontainer.json`), and host auto-detection in `install.sh` (resolving [Issue #2](https://github.com/brotherlogic/hometheatre/issues/2)).
 
 ---
 
@@ -94,31 +94,38 @@ func QueryDriveStatus(devicePath string) (driveStatus int, discStatus int, err e
 
 ---
 
-## 2. Docker Passthrough, Permissions & Capabilities
+## 2. DevPod Passthrough, Permissions & Capabilities (`deploy/devcontainer.json`)
 
 ### 2.1 Device Mapping (`/dev/sr*` + `/dev/sg*`)
 - Optical drives on Linux expose two device nodes:
   1. **Block device (`/dev/sr0`, major `11`):** Used by `blkid`, `lsdvd`, `dvdbackup`, `ddrescue`, and `eject`.
   2. **Generic SCSI character device (`/dev/sg*`, major `21`):** Used for low-level SCSI pass-through (`SG_IO`) and CSS authentication fallbacks on certain drives.
-- Because the drive is permanently attached to the host, `docker-compose.yml` maps both explicit devices discovered by `install.sh` via `.env`:
-  ```yaml
-  devices:
-    - "${OPTICAL_SR_DEVICE:-/dev/sr0}:/dev/sr0"
-    - "${OPTICAL_SG_DEVICE:-/dev/sg0}:${OPTICAL_SG_DEVICE:-/dev/sg0}"
+- Because the drive is permanently attached to the host, `install.sh` renders `deploy/devcontainer.json` with both explicit devices passed via `runArgs`:
+  ```json
+  "runArgs": [
+    "--security-opt",
+    "label=disable",
+    "--network=host",
+    "--device=/dev/sr0:/dev/sr0",
+    "--device=/dev/sg0:/dev/sg0",
+    "--group-add=24",
+    "--env-file",
+    "${localWorkspaceFolder}/.env"
+  ]
   ```
   Inside the container, the block device is normalized to `/dev/sr0` while the matching `/dev/sg*` path is preserved.
 
 ### 2.2 Container User, Group & Linux Capabilities
-- **Process User:** The container runs as `root`.
-  - On Linux, granting `cap_add: [SYS_RAWIO]` in Docker Compose only populates the effective/permitted `CAP_SYS_RAWIO` capability automatically for `root` processes (non-root processes require `setcap` file capabilities on every child binary).
+- **Process User:** The DevPod daemon container runs as `root` (`"remoteUser": "root"`).
+  - On Linux, granting `"capAdd": ["SYS_RAWIO"]` populates the effective/permitted `CAP_SYS_RAWIO` capability automatically for `root` processes (non-root processes require `setcap` file capabilities on every child binary).
   - Running as `root` inside the isolated appliance container guarantees zero permission friction for `DVD_AUTH` ioctls, `SG_IO` SCSI pass-through commands, `blkid -p`, and `eject`.
   - Per [`DOCKER.md`](DOCKER.md), `PUID` / `PGID` environment variables are applied via thread-scoped `unix.Setfsuid(puid)` / `unix.Setfsgid(pgid)` (`WithNFSUser`) whenever creating or writing `.iso`, `.nfo`, and `.probe.json` files on `/mnt/nfs`, ensuring compatibility with `root_squash` NAS exports while the daemon process runs as `root`.
-- **Group & Capabilities in `docker-compose.yml`:**
-  ```yaml
-  group_add:
-    - "${CDROM_GID:-24}" # Debian/Ubuntu default cdrom group GID is 24
-  cap_add:
-    - SYS_RAWIO          # Required for unfiltered SG_IO / raw SCSI MMC & CSS key exchange
+- **Group & Capabilities in `deploy/devcontainer.json`:**
+  ```json
+  "remoteUser": "root",
+  "capAdd": [
+    "SYS_RAWIO"
+  ]
   ```
 
 ---
