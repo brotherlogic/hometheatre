@@ -19,6 +19,13 @@ RUN sed -i 's/Components: main/Components: main contrib/g' /etc/apt/sources.list
         ca-certificates \
         libdvd-pkg && \
     dpkg-reconfigure -f noninteractive libdvd-pkg && \
+    for deb in /usr/src/libdvd-pkg/libdvdcss2_*.deb; do \
+        dpkg-deb -R "$deb" /tmp/libdvdcss2-repack && \
+        sed -i -E 's/(^Depends:.*)libdvd-pkg, */\1/; s/(^Depends:.*), *libdvd-pkg/\1/; s/^Depends: *libdvd-pkg$/Depends:/' /tmp/libdvdcss2-repack/DEBIAN/control && \
+        dpkg-deb -b /tmp/libdvdcss2-repack "$deb" && \
+        rm -rf /tmp/libdvdcss2-repack && \
+        ! dpkg-deb -f "$deb" Depends | grep -q libdvd-pkg; \
+    done && \
     ls -la /usr/src/libdvd-pkg/libdvdcss2_*.deb
 
 # ==============================================================================
