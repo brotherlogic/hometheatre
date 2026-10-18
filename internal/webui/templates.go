@@ -255,7 +255,7 @@ const dashboardTemplateHTML = `<!DOCTYPE html>
                   <label>Pre-Filled TMDB Candidates (Select Match):</label>
                   {{range $cIdx, $cand := $item.Sidecar.TMDBCandidates}}
                     <label class="candidate-option">
-                      <input type="radio" name="candidate_ radio_{{$idx}}"
+                      <input type="radio" name="candidate_radio_{{$idx}}"
                         {{if eq $cIdx 0}}checked{{end}}
                         onclick="selectCandidate({{$idx}}, {{$cand.ID}}, '{{js $cand.Title}}', {{$cand.Year}}, '{{js $cand.MediaType}}')">
                       <div>

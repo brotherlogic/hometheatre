@@ -397,8 +397,13 @@ func TestListAndDeleteUnidentified(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var nfsUserCalls int
 	writer := NewWriter(nfsRoot, 1000, 1000, nil)
 	writer.Logger = log.New(io.Discard, "", 0)
+	writer.NFSUserRunner = func(puid, pgid int, fn func() error) error {
+		nfsUserCalls++
+		return fn()
+	}
 
 	sc1, _ := metadata.MarshalProbeSidecar(&metadata.ProbeSidecar{
 		ISOFilename:    "DISC_A_20261018T140000Z.iso",
@@ -425,12 +430,25 @@ func TestListAndDeleteUnidentified(t *testing.T) {
 		t.Fatalf("expected 2 sorted items (DISC_B then DISC_A), got %+v", items)
 	}
 
+	sidecarA, err := writer.ReadUnidentifiedSidecar("DISC_A_20261018T140000Z.iso")
+	if err != nil || sidecarA.RawLabel != "DISC_A" {
+		t.Fatalf("ReadUnidentifiedSidecar failed: %+v (err=%v)", sidecarA, err)
+	}
+
+	sizeA, err := writer.UnidentifiedISOSize("DISC_A_20261018T140000Z.iso")
+	if err != nil || sizeA != 5 {
+		t.Fatalf("UnidentifiedISOSize failed: got %d, want 5 (err=%v)", sizeA, err)
+	}
+
 	if err := writer.DeleteUnidentified("DISC_A_20261018T140000Z.iso"); err != nil {
 		t.Fatalf("DeleteUnidentified failed: %v", err)
 	}
 	itemsAfter, err := writer.ListUnidentified()
 	if err != nil || len(itemsAfter) != 1 || itemsAfter[0].RawLabel != "DISC_B" {
 		t.Fatalf("expected 1 remaining item DISC_B after delete, got %+v (err=%v)", itemsAfter, err)
+	}
+	if nfsUserCalls != 5 {
+		t.Fatalf("expected 5 NFSUserRunner calls, got %d", nfsUserCalls)
 	}
 }
 

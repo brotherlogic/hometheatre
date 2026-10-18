@@ -508,6 +508,61 @@ func (w *Writer) ListUnidentified() ([]*metadata.ProbeSidecar, error) {
 	return items, nil
 }
 
+// ReadUnidentifiedSidecar reads and parses <NFS_ROOT>/unidentified/<base>.probe.json
+// inside WithNFSUser(puid, pgid) so root_squash NAS exports with restricted world permissions succeed.
+func (w *Writer) ReadUnidentifiedSidecar(unidentifiedISOFilename string) (*metadata.ProbeSidecar, error) {
+	base := filepath.Base(strings.TrimSpace(unidentifiedISOFilename))
+	if base == "" || base == "." || base == ".." || base == "/" {
+		return nil, errors.New("invalid unidentified filename")
+	}
+	probeBase := strings.TrimSuffix(base, filepath.Ext(base)) + ".probe.json"
+	if strings.HasSuffix(base, ".probe.json") {
+		probeBase = base
+	}
+	probePath := filepath.Join(w.NFSRoot, "unidentified", probeBase)
+
+	var sidecar *metadata.ProbeSidecar
+	err := w.withNFSUser(func() error {
+		sc, err := metadata.ReadProbeSidecar(probePath)
+		if err != nil {
+			return err
+		}
+		sidecar = sc
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sidecar, nil
+}
+
+// UnidentifiedISOSize stats <NFS_ROOT>/unidentified/<base>.iso inside WithNFSUser(puid, pgid)
+// and returns its size in bytes.
+func (w *Writer) UnidentifiedISOSize(unidentifiedISOFilename string) (int64, error) {
+	base := filepath.Base(strings.TrimSpace(unidentifiedISOFilename))
+	if base == "" || base == "." || base == ".." || base == "/" {
+		return 0, errors.New("invalid unidentified filename")
+	}
+	isoPath := filepath.Join(w.NFSRoot, "unidentified", base)
+
+	var size int64
+	err := w.withNFSUser(func() error {
+		info, err := os.Stat(isoPath)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory", isoPath)
+		}
+		size = info.Size()
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return size, nil
+}
+
 // DeleteUnidentified removes an unidentified .iso and its companion .probe.json from
 // <NFS_ROOT>/unidentified/ (METADATA.md Section 5.4 option 3).
 func (w *Writer) DeleteUnidentified(unidentifiedISOFilename string) error {

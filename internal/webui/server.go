@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -323,9 +322,8 @@ func (s *Server) buildUnidentifiedView(sc *metadata.ProbeSidecar) UnidentifiedVi
 
 	isoSizeDisplay := ""
 	if s.NFSWriter != nil && sc.ISOFilename != "" {
-		isoPath := filepath.Join(s.NFSWriter.NFSRoot, "unidentified", filepath.Base(sc.ISOFilename))
-		if info, err := os.Stat(isoPath); err == nil && !info.IsDir() {
-			isoSizeDisplay = formatByteSize(info.Size())
+		if size, err := s.NFSWriter.UnidentifiedISOSize(sc.ISOFilename); err == nil {
+			isoSizeDisplay = formatByteSize(size)
 		}
 	}
 
@@ -602,8 +600,7 @@ func (s *Server) executeTagAction(w http.ResponseWriter, r *http.Request, req Ta
 	}
 
 	// Read .probe.json sidecar if available to supply pre-filled defaults
-	probePath := filepath.Join(s.NFSWriter.NFSRoot, "unidentified", strings.TrimSuffix(isoBase, filepath.Ext(isoBase))+".probe.json")
-	sidecar, _ := metadata.ReadProbeSidecar(probePath)
+	sidecar, _ := s.NFSWriter.ReadUnidentifiedSidecar(isoBase)
 
 	rawLabel := isoBase
 	if sidecar != nil && strings.TrimSpace(sidecar.RawLabel) != "" {
