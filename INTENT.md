@@ -15,13 +15,11 @@ Build a zero-touch, appliance-like DVD backup pipeline running in Docker on a Li
 flowchart TD
     A["Physical DVD Inserted (/dev/sr0)"] --> B["Go Daemon: Drive Poller"]
     B --> C["Metadata Probe (blkid Volume Label + lsdvd Track Lengths)"]
-    C --> D{"Stage 1: dvdbackup -M\n(with libdvdcss2)"}
+    C --> D{"Stage 1: dvdbackup -M -r a\n+ genisoimage -dvd-video"}
     D -- "Success" --> E["Eject Physical DVD Immediately"]
-    E --> F["Background Worker: genisoimage -dvd-video\n(Local Scratch Disk)"]
-    D -- "Read Error / ARccOS / RipGuard" --> G["Stage 2 Fallback: ddrescue\n(Unlock CSS + Fast Skip Timeout)"]
-    G --> H["Eject Physical DVD"]
-    F --> I{"TMDB Auto-Match\nHigh Confidence?"}
-    H --> I
+    D -- "Read Error / ARccOS / IFO Error" --> G["Stage 2 Fallback: lsdvd -x + ddrescue\n(Fast Skip + >=95% Rescued Check)"]
+    G --> E
+    E --> I{"Async Worker: TMDB Auto-Match\nHigh Confidence?"}
     I -- "Yes (Movie or Single-Season TV)" --> J["Generate Kodi .nfo + Move .iso to NFS\n(/movies or /tv)"]
     I -- "No / Cryptic Label / Multi-Disc TV" --> K["Move .iso to NFS /unidentified\n+ Queue in Local Web UI"]
     K --> L["User Tags in Web UI (TMDB Search + SxxExx Picker)"]
@@ -40,15 +38,15 @@ flowchart TD
 
 ### 3.2 Storage & Staging Strategy
 - **Local Scratch Disk (`SCRATCH_DIR`):** Requires ~20 GB of free local disk space on the container host.
-  - Ripping to local disk first avoids network bottlenecks/stalls during optical reads and allows the physical DVD tray to **eject immediately** once `dvdbackup` finishes reading the disc—while `genisoimage` and the NFS file transfer continue asynchronously in the background.
+  - Ripping and building the `.iso` on local disk first avoids network bottlenecks/stalls during optical reads, ensures Stage 2 (`ddrescue`) fallback can still access the physical disc if `genisoimage -dvd-video` rejects protected `.IFO` tables, and allows the physical DVD tray to **eject immediately** once the local `.iso` is finalized—while TMDB matching and the multi-gigabyte NFS file transfer continue asynchronously in the background.
 - **NAS NFS Mount:** Mounted directly by Docker Compose using the local `nfs` volume driver (configured via `.env` variables `NFS_SERVER`, `NFS_PATH`, `NFS_OPTS`).
 
 ### 3.3 DVD Ripping Engine (100% Open-Source, Two-Stage Pipeline)
 - **Output Format:** Decrypted, region-free 1:1 `.iso` image (preserves DVD menus and extras; supported natively by Kodi's `VideoPlayer` over NFS).
-- **Decryption:** `libdvdcss2` + `libdvdread` (no proprietary software or expiring MakeMKV beta keys).
-- **Two-Stage Rip Strategy:**
-  1. **Primary (`dvdbackup` + `genisoimage`):** Runs `dvdbackup -M` to mirror the decrypted `VIDEO_TS` structure to local scratch, ejects the disc, and runs `genisoimage -dvd-video` to produce a clean, compliant DVD `.iso`.
-  2. **Fallback (`ddrescue`):** Commercial DVDs with structural copy protection (Sony ARccOS, Disney X-Protect, Lionsgate RipGuard) or minor physical scratches may fail file-level `dvdbackup`. When detected, the pipeline unlocks the drive's CSS title keys (via `lsdvd`/`libdvdread`) and falls back to `ddrescue` with bounded retry/skip timeouts so bad dummy sectors are skipped cleanly without hanging the drive.
+- **Decryption:** `libdvdcss2` + `libdvdread` compiled cleanly in an intermediate Docker build stage via `libdvd-pkg` (no proprietary software or expiring MakeMKV beta keys).
+- **Two-Stage Rip Strategy — See [`RIPPING.md`](RIPPING.md):**
+  1. **Primary (`dvdbackup` + `genisoimage`):** Runs `dvdbackup -M -r a -n dvd` to mirror the decrypted `VIDEO_TS` structure to local scratch, builds the compliant DVD `.iso` via `genisoimage -quiet -dvd-video`, removes the temporary `VIDEO_TS` folder, and immediately ejects the disc.
+  2. **Fallback (`ddrescue`):** Commercial DVDs with structural copy protection (Sony ARccOS, Disney X-Protect, Lionsgate RipGuard) or minor physical scratches may fail `dvdbackup` or `genisoimage -dvd-video`. When detected, the pipeline re-unlocks the drive's CSS bus (`lsdvd -x`), runs single-pass `ddrescue` (`-b 2048 -n -N -K 64Ki,1Mi -O -T 2m`), verifies `>= 95%` rescued sectors in the mapfile, and ejects the disc.
 
 ### 3.4 Identification, Kodi Naming, & `.nfo` Sidecars
 - **Media Types Supported:** Both **Movies** and **TV Series** box sets.
@@ -119,11 +117,11 @@ Before building out the full Go daemon and installer scripts, we should research
 1. **Optical Drive Detection & Polling in Docker (Linux `/dev/sr0` + `/dev/sg*`) — See [`DRIVE.md`](DRIVE.md):**
    - Best non-intrusive way in Go/Linux to poll `/dev/sr0` for disc presence (`ioctl` `CDROM_DRIVE_STATUS` vs `blkid` / `/sys/class/block/sr0/events`) without repeatedly spinning up an empty drive or blocking when the tray is open.
    - Required Docker device mappings (`/dev/sr0` + `/dev/sg*`), group permissions (`cdrom`), and capabilities (`SYS_RAWIO` if needed for CSS key exchange).
-2. **`libdvdcss2` Installation in Debian/Ubuntu Docker Images:**
-   - Clean, non-interactive installation of `libdvdcss2` inside a Dockerfile (via Debian `contrib` `libdvd-pkg` or VideoLAN apt repository) so container builds are deterministic.
-3. **Two-Stage Rip Commands & Flags (`dvdbackup`, `genisoimage`, `ddrescue`):**
-   - Exact CLI flags for `dvdbackup -M` + `genisoimage -dvd-video -udf` to preserve DVD menu navigation and dual-layer (`DVD-9`) compatibility.
-   - Best `ddrescue` flags (`--no-split`, `--max-read-rate`, timeout/retry flags) after warming CSS keys via `lsdvd` / `dvdbackup` so ARccOS/RipGuard dummy sectors are skipped in seconds rather than minutes.
+2. **`libdvdcss2` Installation in Debian/Ubuntu Docker Images — See [`RIPPING.md`](RIPPING.md):**
+   - Clean, non-interactive installation of `libdvdcss2` inside a multi-stage Dockerfile (compiling `libdvdcss2_*.deb` via Debian `contrib` `libdvd-pkg` in an intermediate builder stage and installing only the `.deb` in `debian:bookworm-slim`).
+3. **Two-Stage Rip Commands & Flags (`dvdbackup`, `genisoimage`, `ddrescue`) — See [`RIPPING.md`](RIPPING.md):**
+   - Exact CLI flags for Stage 1 (`dvdbackup -M -r a -n dvd` + `genisoimage -quiet -dvd-video -V <LABEL_32>`) prior to ejecting so `.IFO` layout errors can still fall back to Stage 2.
+   - Stage 2 `ddrescue` flags (`-b 2048 -n -N -K 64Ki,1Mi -O -T 2m`) after re-unlocking CSS bus keys via `lsdvd -x /dev/sr0`, plus `>= 95%` rescued mapfile validation.
 4. **DVD Volume Label & `lsdvd` Parsing Heuristics:**
    - Parsing `lsdvd -Ox` (XML) or `lsdvd -Oj` (JSON) output in Go to reliably extract track lengths, distinguish Movies from multi-episode TV discs, and clean up raw DVD volume labels (stripping `_16X9`, `_WS`, `DISC_1`, etc.) before querying TMDB.
 5. **Kodi `.nfo` Specification for Movie & Multi-Episode TV ISOs:**
