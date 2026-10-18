@@ -19,10 +19,10 @@ flowchart TD
     D -- "Success" --> E["Eject Physical DVD Immediately"]
     D -- "Read Error / ARccOS / IFO Error" --> G["Stage 2 Fallback: lsdvd -x + ddrescue\n(Fast Skip + >=95% Rescued Check)"]
     G --> E
-    E --> I{"Async Worker: TMDB Auto-Match\nHigh Confidence?"}
-    I -- "Yes (Movie or Single-Season TV)" --> J["Generate Kodi .nfo + Move .iso to NFS\n(/movies or /tv)"]
-    I -- "No / Cryptic Label / Multi-Disc TV" --> K["Move .iso to NFS /unidentified\n+ Queue in Local Web UI"]
-    K --> L["User Tags in Web UI (TMDB Search + SxxExx Picker)"]
+    E --> I{"Async Worker: TMDB Auto-Match\nHigh-Confidence Movie?"}
+    I -- "Yes (Exact Title + Runtime Match)" --> J["Generate Kodi .nfo + Move .iso to NFS\n(/movies or /tv)"]
+    I -- "No / Cryptic Label / TV Series Disc" --> K["Move .iso + .probe.json to NFS /unidentified\n+ Queue in Local Web UI"]
+    K --> L["User Confirms in Web UI (Pre-Filled TMDB + SxxExx Picker)"]
     L --> J
     J --> M["Kodi on Google TV & Tablet\n(Reads NFS Share Directly)"]
 ```
@@ -48,11 +48,12 @@ flowchart TD
   1. **Primary (`dvdbackup` + `genisoimage`):** Runs `dvdbackup -M -r a -n dvd` to mirror the decrypted `VIDEO_TS` structure to local scratch, builds the compliant DVD `.iso` via `genisoimage -quiet -dvd-video`, removes the temporary `VIDEO_TS` folder, and immediately ejects the disc.
   2. **Fallback (`ddrescue`):** Commercial DVDs with structural copy protection (Sony ARccOS, Disney X-Protect, Lionsgate RipGuard) or minor physical scratches may fail `dvdbackup` or `genisoimage -dvd-video`. When detected, the pipeline re-unlocks the drive's CSS bus (`lsdvd -x`), runs single-pass `ddrescue` (`-b 2048 -n -N -K 64Ki,1Mi -O -T 2m`), verifies `>= 95%` rescued sectors in the mapfile, and ejects the disc.
 
-### 3.4 Identification, Kodi Naming, & `.nfo` Sidecars
+### 3.4 Identification, Kodi Naming, & `.nfo` Sidecars — See [`METADATA.md`](METADATA.md)
 - **Media Types Supported:** Both **Movies** and **TV Series** box sets.
 - **Heuristics + TMDB Lookup:**
-  - Extracts raw volume label (`blkid`) and title count/durations (`lsdvd`).
-  - Uses track duration heuristics (e.g., one 80–210 min feature track = Movie; multiple 20–60 min tracks = TV Series disc with $N$ episodes) combined with the **TMDB API**.
+  - Extracts raw volume label (`blkid` primary, `lsdvd -Ox` fallback) and title durations (`lsdvd -Ox` XML, re-probing the finalized local `.iso` if the initial `/dev/sr0` probe failed).
+  - Filters out composite `"Play All"` tracks and deduplicates identical-duration logical PGCs (`Δ < 0.1s`) to classify **Movie** (`60–240m` feature track) vs. **TV Series** ($N \ge 2$ clustered `18–65m` episode tracks).
+  - Auto-files high-confidence **Movies** (non-generic label + exact normalized TMDB title match + DVD feature duration within `±15m` of TMDB runtime); routes **TV Series** discs and ambiguous/cryptic discs to `/unidentified` with a `.probe.json` sidecar containing pre-populated TMDB candidates and suggested episode counts for 1-click Web UI confirmation.
 - **Kodi NFS Directory Layout & Naming Conventions:**
   - **Movies:**
     ```text
@@ -61,18 +62,22 @@ flowchart TD
       └── Movie Title (Year).nfo
     ```
   - **TV Series (Multi-Episode ISO):**
-    Kodi requires multi-episode DVD ISOs to list the episodes in the filename so its TV scraper indexes every episode on the disc:
+    Kodi requires a series-level `tvshow.nfo` in the show root directory plus multi-episode DVD ISOs that list the episodes in the filename and companion `.nfo` so its TV scraper indexes every episode on the disc:
     ```text
-    <NFS_ROOT>/tv/Show Title (Year)/Season 01/
-      ├── Show Title - S01E01E02E03E04.iso
-      └── Show Title - S01E01E02E03E04.nfo
+    <NFS_ROOT>/tv/Show Title (Year)/
+      ├── tvshow.nfo
+      └── Season 01/
+          ├── Show Title - S01E01E02E03E04.iso
+          └── Show Title - S01E01E02E03E04.nfo
     ```
-  - **Unidentified / Ambiguous Discs:**
+  - **Unidentified / Needs Confirmation Queue:**
     ```text
-    <NFS_ROOT>/unidentified/<RAW_LABEL>_<TIMESTAMP>.iso
+    <NFS_ROOT>/unidentified/
+      ├── <RAW_LABEL>_<TIMESTAMP>.iso
+      └── <RAW_LABEL>_<TIMESTAMP>.probe.json
     ```
 - **Companion `.nfo` Files:**
-  - Every identified `.iso` gets a companion Kodi `.nfo` XML file containing the exact TMDB URL/ID and metadata. This ensures independent Kodi instances on Google TV and tablets always match 100% accurately without mis-scraping.
+  - Every identified `.iso` gets a companion Kodi `.nfo` XML file populated from TMDB (`<movie>` or concatenated `<episodedetails>` blocks, plus idempotent `<tvshow>` `tvshow.nfo`) with `<uniqueid type="tmdb" default="true">`. This ensures independent Kodi instances on Google TV and tablets always match 100% accurately without mis-scraping.
 
 ### 3.5 Lightweight Go Service & Web UI
 - **Language:** **Go (Golang)** compiled via a multi-stage Dockerfile into a single static binary.
@@ -122,10 +127,10 @@ Before building out the full Go daemon and installer scripts, we should research
 3. **Two-Stage Rip Commands & Flags (`dvdbackup`, `genisoimage`, `ddrescue`) — See [`RIPPING.md`](RIPPING.md):**
    - Exact CLI flags for Stage 1 (`dvdbackup -M -r a -n dvd` + `genisoimage -quiet -dvd-video -V <LABEL_32>`) prior to ejecting so `.IFO` layout errors can still fall back to Stage 2.
    - Stage 2 `ddrescue` flags (`-b 2048 -n -N -K 64Ki,1Mi -O -T 2m`) after re-unlocking CSS bus keys via `lsdvd -x /dev/sr0`, plus `>= 95%` rescued mapfile validation.
-4. **DVD Volume Label & `lsdvd` Parsing Heuristics:**
-   - Parsing `lsdvd -Ox` (XML) or `lsdvd -Oj` (JSON) output in Go to reliably extract track lengths, distinguish Movies from multi-episode TV discs, and clean up raw DVD volume labels (stripping `_16X9`, `_WS`, `DISC_1`, etc.) before querying TMDB.
-5. **Kodi `.nfo` Specification for Movie & Multi-Episode TV ISOs:**
-   - Verify exact Kodi `.nfo` XML schema for standalone movies and multi-episode TV `.iso` files (`<episodedetails>` blocks + TMDB unique IDs) so Kodi scrapes posters, episode titles, and descriptions automatically.
+4. **DVD Volume Label & `lsdvd` Parsing Heuristics — See [`METADATA.md`](METADATA.md):**
+   - Parsing `lsdvd -Ox` (XML in `lsdvd 0.17`, with bare `&` / UTF-8 sanitization in Go), filtering composite `"Play All"` tracks and duplicate logical PGCs (`Δ < 0.1s`), classifying Movies vs. TV Series discs, sanitizing raw DVD volume labels, and persisting `.probe.json` sidecars in `/unidentified`.
+5. **Kodi `.nfo` Specification for Movie & Multi-Episode TV ISOs — See [`METADATA.md`](METADATA.md):**
+   - Full Kodi `.nfo` XML schemas populated from TMDB for standalone movies (`<movie>`), TV series root directories (`tvshow.nfo` `<tvshow>`), and multi-episode TV `.iso` files (concatenated root-level `<episodedetails>` blocks with `<uniqueid type="tmdb" default="true">`).
 6. **Docker Compose NFS Volume Driver Behavior:**
    - Confirm best NFS mount options (`nfsvers=4` vs `nfsvers=3`, `nolock`, `soft`/`hard`) in `docker-compose.yml` on Debian/Ubuntu hosts and how `install.sh` should pre-flight test NFS write access.
 
