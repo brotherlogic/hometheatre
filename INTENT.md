@@ -36,10 +36,10 @@ flowchart TD
 - **Runtime:** Docker & Docker Compose (`restart: unless-stopped`).
 - **Drive Detection:** In-container polling loop monitoring `/dev/sr0` state changes (avoids fragile host-level `udev` triggers calling `docker exec` and keeps live drive status visible in the Web UI).
 
-### 3.2 Storage & Staging Strategy
+### 3.2 Storage & Staging Strategy — See [`DOCKER.md`](DOCKER.md)
 - **Local Scratch Disk (`SCRATCH_DIR`):** Requires ~20 GB of free local disk space on the container host.
   - Ripping and building the `.iso` on local disk first avoids network bottlenecks/stalls during optical reads, ensures Stage 2 (`ddrescue`) fallback can still access the physical disc if `genisoimage -dvd-video` rejects protected `.IFO` tables, and allows the physical DVD tray to **eject immediately** once the local `.iso` is finalized—while TMDB matching and the multi-gigabyte NFS file transfer continue asynchronously in the background.
-- **NAS NFS Mount:** Mounted directly by Docker Compose using the local `nfs` volume driver (configured via `.env` variables `NFS_SERVER`, `NFS_PATH`, `NFS_OPTS`).
+- **NAS NFS Mount:** Mounted directly by Docker Compose using the local `nfs` volume driver (`addr=${NFS_SERVER_IP},${NFS_OPTS}`), with `install.sh` auto-probing `nfsvers=4` (falling back to `nfsvers=3,nolock`), auto-detecting share `PUID`/`PGID` for `root_squash` compatibility (applied via thread-scoped `Setfsuid`/`Setfsgid` in Go), and staging transfers to hidden `.iso.partial` files with `fsync` + atomic `os.Rename`.
 
 ### 3.3 DVD Ripping Engine (100% Open-Source, Two-Stage Pipeline)
 - **Output Format:** Decrypted, region-free 1:1 `.iso` image (preserves DVD menus and extras; supported natively by Kodi's `VideoPlayer` over NFS).
@@ -131,8 +131,8 @@ Before building out the full Go daemon and installer scripts, we should research
    - Parsing `lsdvd -Ox` (XML in `lsdvd 0.17`, with bare `&` / UTF-8 sanitization in Go), filtering composite `"Play All"` tracks and duplicate logical PGCs (`Δ < 0.1s`), classifying Movies vs. TV Series discs, sanitizing raw DVD volume labels, and persisting `.probe.json` sidecars in `/unidentified`.
 5. **Kodi `.nfo` Specification for Movie & Multi-Episode TV ISOs — See [`METADATA.md`](METADATA.md):**
    - Full Kodi `.nfo` XML schemas populated from TMDB for standalone movies (`<movie>`), TV series root directories (`tvshow.nfo` `<tvshow>`), and multi-episode TV `.iso` files (concatenated root-level `<episodedetails>` blocks with `<uniqueid type="tmdb" default="true">`).
-6. **Docker Compose NFS Volume Driver Behavior:**
-   - Confirm best NFS mount options (`nfsvers=4` vs `nfsvers=3`, `nolock`, `soft`/`hard`) in `docker-compose.yml` on Debian/Ubuntu hosts and how `install.sh` should pre-flight test NFS write access.
+6. **Docker Compose NFS Volume Driver Behavior — See [`DOCKER.md`](DOCKER.md):**
+   - Auto-negotiated `nfsvers=4` (fallback `nfsvers=3,nolock`) with `rw,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noatime`, IP resolution for `addr=`, `install.sh` pre-flight write/ownership testing (`PUID`/`PGID` + `Setfsuid`/`Setfsgid` for `root_squash`), Docker volume recreation on config changes, and atomic `.iso.partial` + `fsync` + `os.Rename` transfer staging.
 
 ---
 
