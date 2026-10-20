@@ -438,6 +438,9 @@ func TestWorkerStage2LowRescuedRatioCleansUpAndEjects(t *testing.T) {
 	w.Now = func() time.Time { return time.Date(2026, 10, 18, 16, 15, 0, 0, time.UTC) }
 	w.CheckSpace = func(dir string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
 	w.QueryDriveStatus = func(dev string) (int, int, error) {
+		if ejected > 0 {
+			return drive.CDS_TRAY_OPEN, drive.CDS_NO_INFO, nil
+		}
 		return drive.CDS_DISC_OK, drive.CDS_DATA_1, nil
 	}
 	w.Sleep = func(ctx context.Context, d time.Duration) error {
@@ -513,6 +516,7 @@ func TestWorkerStage1RetriesDVDBackupAfterTransientDriveReset(t *testing.T) {
 	var logBuf bytes.Buffer
 	dvdbackupAttempts := 0
 	statusChecks := 0
+	ejected := 0
 	ddrescueCalled := false
 
 	w := NewWorker(scratchDir, "/dev/sr0")
@@ -521,6 +525,9 @@ func TestWorkerStage1RetriesDVDBackupAfterTransientDriveReset(t *testing.T) {
 	w.CheckSpace = func(dir string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
 	w.Stage1RetryBackoffs = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
 	w.QueryDriveStatus = func(dev string) (int, int, error) {
+		if ejected > 0 {
+			return drive.CDS_TRAY_OPEN, drive.CDS_NO_INFO, nil
+		}
 		statusChecks++
 		if statusChecks == 1 {
 			// Simulate drive still settling / spinning up on first readiness check
@@ -553,6 +560,7 @@ func TestWorkerStage1RetriesDVDBackupAfterTransientDriveReset(t *testing.T) {
 			ddrescueCalled = true
 			return "", nil
 		case "eject":
+			ejected++
 			return "", nil
 		default:
 			return "", nil
@@ -581,9 +589,224 @@ func TestWorkerStage1RetriesDVDBackupAfterTransientDriveReset(t *testing.T) {
 		`Initial probe on /dev/sr0: label="THE_MATRIX_16X9" (safe="THE_MATRIX_16X9"), tracks=0, err=libdvdread: Can't open /dev/sr0 for reading`,
 		`Stage 1 dvdbackup attempt 1/3 failed`,
 		`Drive /dev/sr0 ready (CDS_DISC_OK); retrying Stage 1 dvdbackup (attempt 2/3)`,
+		`Ejected /dev/sr0 (status=Tray Open)`,
 	} {
 		if !strings.Contains(logs, wantLog) {
 			t.Errorf("expected daemon logs to contain %q, got:\n%s", wantLog, logs)
+		}
+	}
+}
+
+func TestQueryDiscCapacityAndSysfsFallback(t *testing.T) {
+	// 1. Verify sysfs /sys/class/block/sr0/size parsing (512-byte sectors)
+	sysfsRoot := t.TempDir()
+	sr0Dir := filepath.Join(sysfsRoot, "sr0")
+	if err := os.MkdirAll(sr0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 16,000,000 * 512 = 8,192,000,000 bytes (~7.63 GiB)
+	if err := os.WriteFile(filepath.Join(sr0Dir, "size"), []byte("16000000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gotSysfs, err := readSysfsBlockCapacity(sysfsRoot, "/dev/sr0")
+	if err != nil {
+		t.Fatalf("readSysfsBlockCapacity unexpected error: %v", err)
+	}
+	wantSysfs := int64(16000000) * 512
+	if gotSysfs != wantSysfs {
+		t.Fatalf("readSysfsBlockCapacity = %d, want %d", gotSysfs, wantSysfs)
+	}
+
+	// 2. Verify QueryDiscCapacity falls back to regular file size
+	fakeDev := filepath.Join(t.TempDir(), "fake_disc.iso")
+	createSparseISO(t, fakeDev, 4*1024*1024*1024)
+	gotFile, err := QueryDiscCapacity(fakeDev)
+	if err != nil {
+		t.Fatalf("QueryDiscCapacity on regular file failed: %v", err)
+	}
+	if gotFile != 4*1024*1024*1024 {
+		t.Fatalf("QueryDiscCapacity = %d, want %d", gotFile, int64(4*1024*1024*1024))
+	}
+}
+
+func TestWorkerLiveProgressAcrossStages(t *testing.T) {
+	ctx := context.Background()
+	scratchDir := t.TempDir()
+
+	const totalDiscBytes int64 = 4 * 1024 * 1024 * 1024 // 4 GiB
+	const stage1VOBBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB written in VIDEO_TS
+	const stage1ISOBytes int64 = 1 * 1024 * 1024 * 1024 // 1 GiB written so far to disc.iso
+
+	var stage1AProg, stage1BProg, stage2MapProg, stage2ISOFallbackProg Progress
+
+	w := NewWorker(scratchDir, "/dev/sr0")
+	w.Logger = log.New(io.Discard, "", 0)
+	w.Now = func() time.Time { return time.Date(2026, 10, 18, 23, 50, 0, 0, time.UTC) }
+	w.CheckSpace = func(dir string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
+	w.QueryDiscSize = func(dev string) (int64, error) { return totalDiscBytes, nil }
+
+	// Before ripping starts, Progress().Active must be false
+	if p := w.Progress(); p.Active {
+		t.Fatalf("expected Progress().Active == false when idle, got %+v", p)
+	}
+
+	w.RunCommand = func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+		switch name {
+		case "blkid":
+			return "THE_MATRIX_16X9\n", nil
+		case "lsdvd":
+			return `<?xml version="1.0" encoding="UTF-8"?><lsdvd><title>THE_MATRIX_16X9</title><track><ix>1</ix><length>8160.200</length></track></lsdvd>`, nil
+		case "dvdbackup":
+			if len(args) > 0 && args[0] == "-M" {
+				jobDir := args[len(args)-1]
+				videoTS := filepath.Join(jobDir, "dvd", "VIDEO_TS")
+				if err := os.MkdirAll(videoTS, 0o755); err != nil {
+					return "", err
+				}
+				createSparseISO(t, filepath.Join(videoTS, "VTS_01_1.VOB"), stage1VOBBytes/2)
+				createSparseISO(t, filepath.Join(videoTS, "VTS_01_2.VOB"), stage1VOBBytes/2)
+				stage1AProg = w.Progress()
+				return "", nil
+			}
+			return "", nil
+		case "genisoimage":
+			outISO := args[5]
+			createSparseISO(t, outISO, stage1ISOBytes)
+			stage1BProg = w.Progress()
+			// Return error to exercise Stage 2 ddrescue progress tracking in the same run
+			return "genisoimage: simulated failure to test Stage 2 progress", errors.New("exit status 1")
+		case "ddrescue":
+			isoPath := args[len(args)-2]
+			mapPath := args[len(args)-1]
+			// First check fallback when only disc.iso exists before ddrescue.map is flushed
+			createSparseISO(t, isoPath, 3*1024*1024*1024)
+			stage2ISOFallbackProg = w.Progress()
+
+			// Now write ddrescue.map with 0xC0000000 (3 GiB) rescued out of 0x100000000 (4 GiB)
+			mapData := `# Mapfile
+0xC0000000 + 1
+0x00000000  0xC0000000  +
+0xC0000000  0x40000000  ?
+`
+			if err := os.WriteFile(mapPath, []byte(mapData), 0o644); err != nil {
+				return "", err
+			}
+			stage2MapProg = w.Progress()
+
+			// Finalize mapfile to >= 95% rescued so RipDisc succeeds
+			finalMap := `# Mapfile
+0x100000000 + 1
+0x00000000  0xFC000000  +
+0xFC000000  0x04000000  -
+`
+			_ = os.WriteFile(mapPath, []byte(finalMap), 0o644)
+			return "", nil
+		case "eject":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	if _, err := w.RipDisc(ctx, "/dev/sr0"); err != nil {
+		t.Fatalf("RipDisc failed: %v", err)
+	}
+
+	// Verify Stage 1A (stage1_dvdbackup) progress: 2 GiB / 4 GiB = 50.0%
+	if !stage1AProg.Active || stage1AProg.Stage != Stage1DVDBackup || stage1AProg.Label != "THE_MATRIX_16X9" {
+		t.Fatalf("unexpected Stage 1A progress metadata: %+v", stage1AProg)
+	}
+	if stage1AProg.BytesDone != stage1VOBBytes || stage1AProg.BytesTotal != totalDiscBytes || stage1AProg.Percent != 50.0 {
+		t.Fatalf("Stage 1A progress got %+v, want BytesDone=%d BytesTotal=%d Percent=50.0", stage1AProg, stage1VOBBytes, totalDiscBytes)
+	}
+
+	// Verify Stage 1B (stage1_genisoimage) progress: 1 GiB ISO / 2 GiB extracted <job_dir>/dvd = 50.0%
+	if !stage1BProg.Active || stage1BProg.Stage != Stage1GenISOImage {
+		t.Fatalf("unexpected Stage 1B progress metadata: %+v", stage1BProg)
+	}
+	if stage1BProg.BytesDone != stage1ISOBytes || stage1BProg.BytesTotal != stage1VOBBytes || stage1BProg.Percent != 50.0 {
+		t.Fatalf("Stage 1B progress got %+v, want BytesDone=%d BytesTotal=%d Percent=50.0", stage1BProg, stage1ISOBytes, stage1VOBBytes)
+	}
+
+	// Verify Stage 2 (stage2_ddrescue) progress via disc.iso fallback and ddrescue.map: 3 GiB / 4 GiB = 75.0%
+	wantStage2Done := int64(3 * 1024 * 1024 * 1024)
+	if !stage2ISOFallbackProg.Active || stage2ISOFallbackProg.BytesDone != wantStage2Done || stage2ISOFallbackProg.Percent != 75.0 {
+		t.Fatalf("Stage 2 ISO fallback progress got %+v, want BytesDone=%d Percent=75.0", stage2ISOFallbackProg, wantStage2Done)
+	}
+	if !stage2MapProg.Active || stage2MapProg.Stage != Stage2DDRescue || stage2MapProg.BytesDone != wantStage2Done || stage2MapProg.BytesTotal != totalDiscBytes || stage2MapProg.Percent != 75.0 {
+		t.Fatalf("Stage 2 map progress got %+v, want BytesDone=%d BytesTotal=%d Percent=75.0", stage2MapProg, wantStage2Done, totalDiscBytes)
+	}
+
+	// After RipDisc returns, Progress().Active must reset to false
+	if p := w.Progress(); p.Active {
+		t.Fatalf("expected Progress().Active == false after RipDisc completes, got %+v", p)
+	}
+}
+
+func TestWorkerEjectRetriesWhenTrayStaysClosed(t *testing.T) {
+	ctx := context.Background()
+	scratchDir := t.TempDir()
+
+	var logBuf bytes.Buffer
+	var sleepDurations []time.Duration
+	ejectCalls := 0
+
+	w := NewWorker(scratchDir, "/dev/sr0")
+	w.Logger = log.New(&logBuf, "", 0)
+	w.Now = func() time.Time { return time.Date(2026, 10, 19, 0, 18, 48, 0, time.UTC) }
+	w.CheckSpace = func(dir string) (uint64, error) { return 30 * 1024 * 1024 * 1024, nil }
+	w.Sleep = func(ctx context.Context, d time.Duration) error {
+		sleepDurations = append(sleepDurations, d)
+		return nil
+	}
+	// Simulate eject exiting 0 on attempt 1 while the tray stays closed (CDS_DISC_OK) due to
+	// host udev/spin-down race, then opening (CDS_TRAY_OPEN) on attempt 2.
+	w.QueryDriveStatus = func(dev string) (int, int, error) {
+		if ejectCalls >= 2 {
+			return drive.CDS_TRAY_OPEN, drive.CDS_NO_INFO, nil
+		}
+		return drive.CDS_DISC_OK, drive.CDS_DATA_1, nil
+	}
+	w.RunCommand = func(ctx context.Context, env []string, name string, args ...string) (string, error) {
+		switch name {
+		case "blkid":
+			return "MARATHON_MAN\n", nil
+		case "lsdvd":
+			return `<?xml version="1.0" encoding="UTF-8"?><lsdvd><title>MARATHON_MAN</title><track><ix>1</ix><length>7500.000</length></track></lsdvd>`, nil
+		case "dvdbackup":
+			jobDir := args[len(args)-1]
+			_ = os.MkdirAll(filepath.Join(jobDir, "dvd", "VIDEO_TS"), 0o755)
+			return "", nil
+		case "genisoimage":
+			outISO := args[5]
+			createSparseISO(t, outISO, MinISOSizeBytes+4096)
+			return "", nil
+		case "eject":
+			ejectCalls++
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	if _, err := w.RipDisc(ctx, "/dev/sr0"); err != nil {
+		t.Fatalf("RipDisc failed: %v", err)
+	}
+	if ejectCalls != 2 {
+		t.Fatalf("expected 2 eject calls when first attempt leaves drive in CDS_DISC_OK, got %d", ejectCalls)
+	}
+	wantSleeps := []time.Duration{DefaultEjectRetryBackoffs[0]}
+	if !reflect.DeepEqual(sleepDurations, wantSleeps) {
+		t.Fatalf("expected eject retry backoff %v, got %v", wantSleeps, sleepDurations)
+	}
+
+	logs := logBuf.String()
+	for _, wantLog := range []string{
+		`Warning: eject /dev/sr0 attempt 1/3 exited 0 but drive status is still Disc Ready (4)`,
+		`Ejected /dev/sr0 (status=Tray Open)`,
+	} {
+		if !strings.Contains(logs, wantLog) {
+			t.Errorf("expected logs to contain %q, got:\n%s", wantLog, logs)
 		}
 	}
 }

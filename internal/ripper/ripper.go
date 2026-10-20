@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/brotherlogic/hometheatre/internal/drive"
 	"github.com/brotherlogic/hometheatre/internal/metadata"
@@ -65,6 +66,14 @@ var DefaultStage1RetryBackoffs = []time.Duration{
 	3 * time.Second,
 }
 
+// DefaultEjectRetryBackoffs defines the retry backoff schedule when ejecting
+// the optical drive fails or CDROM_DRIVE_STATUS remains CDS_DISC_OK / CDS_DRIVE_NOT_READY
+// (up to 3 total attempts: initial + 2 retries with 1s, 2s backoff).
+var DefaultEjectRetryBackoffs = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+}
+
 // ErrInsufficientScratchSpace is returned when available scratch disk space is < 18 GiB
 // and no in-flight or queued NFS transfer is freeing space.
 var ErrInsufficientScratchSpace = errors.New("insufficient_scratch_space")
@@ -83,6 +92,16 @@ type Job struct {
 	ISOPath string `json:"-"`
 }
 
+// Progress represents live byte and percentage progress for an active rip job.
+type Progress struct {
+	Active     bool    `json:"active"`
+	Stage      string  `json:"stage,omitempty"`
+	Label      string  `json:"label,omitempty"`
+	BytesDone  int64   `json:"bytes_done"`
+	BytesTotal int64   `json:"bytes_total"`
+	Percent    float64 `json:"percent"`
+}
+
 // FailureEvent captures diagnostic metadata when a rip aborts or fails validation.
 type FailureEvent struct {
 	JobID        string
@@ -99,6 +118,9 @@ type CommandRunner func(ctx context.Context, env []string, name string, args ...
 
 // StatfsFunc returns the available free bytes on the filesystem containing dir.
 type StatfsFunc func(dir string) (uint64, error)
+
+// DiscSizeFunc returns the byte capacity of the optical disc in devicePath.
+type DiscSizeFunc func(devicePath string) (int64, error)
 
 // PendingTransfersFunc returns true if an in-flight or queued NFS transfer is currently
 // holding a finalized .iso in the scratch directory.
@@ -127,6 +149,48 @@ func CheckScratchSpace(scratchDir string) (uint64, error) {
 		return 0, fmt.Errorf("statfs %s: %w", scratchDir, err)
 	}
 	return uint64(stat.Bavail) * uint64(stat.Bsize), nil
+}
+
+// QueryDiscCapacity queries the total byte capacity of the optical disc on devicePath
+// via ioctl(BLKGETSIZE64), falling back to /sys/class/block/<dev>/size (512-byte sectors)
+// or regular file size.
+func QueryDiscCapacity(devicePath string) (int64, error) {
+	if fd, err := unix.Open(devicePath, unix.O_RDONLY|unix.O_NONBLOCK, 0); err == nil {
+		var size uint64
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.BLKGETSIZE64), uintptr(unsafe.Pointer(&size)))
+		_ = unix.Close(fd)
+		if errno == 0 && size > 0 {
+			return int64(size), nil
+		}
+	}
+
+	if size, err := readSysfsBlockCapacity("/sys/class/block", devicePath); err == nil && size > 0 {
+		return size, nil
+	}
+
+	if info, err := os.Stat(devicePath); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+		return info.Size(), nil
+	}
+
+	return 0, fmt.Errorf("unable to query disc capacity for %s", devicePath)
+}
+
+func readSysfsBlockCapacity(sysfsBlockDir, devicePath string) (int64, error) {
+	devBase := filepath.Base(strings.TrimSpace(devicePath))
+	if devBase == "" || devBase == "." || devBase == "/" {
+		return 0, fmt.Errorf("invalid device path %q", devicePath)
+	}
+	sizePath := filepath.Join(sysfsBlockDir, devBase, "size")
+	data, err := os.ReadFile(sizePath)
+	if err != nil {
+		return 0, err
+	}
+	sectors, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	// Linux sysfs /sys/class/block/<dev>/size always reports 512-byte sectors.
+	return int64(sectors) * 512, nil
 }
 
 // SanitizeVolumeID sanitizes a raw blkid DVD label to [A-Z0-9_] and truncates it to
@@ -349,8 +413,10 @@ type Worker struct {
 	MinISOSize          int64
 	SpaceWaitInterval   time.Duration
 	Stage1RetryBackoffs []time.Duration
+	EjectRetryBackoffs  []time.Duration
 	RunCommand          CommandRunner
 	CheckSpace          StatfsFunc
+	QueryDiscSize       DiscSizeFunc
 	QueryDriveStatus    drive.StatusQueryFunc
 	Sleep               func(ctx context.Context, d time.Duration) error
 	HasPendingTransfers PendingTransfersFunc
@@ -359,8 +425,13 @@ type Worker struct {
 	Now                 func() time.Time
 	Logger              *log.Logger
 
-	mu     sync.RWMutex
-	status string
+	mu               sync.RWMutex
+	status           string
+	activeJobDir     string
+	activeStage      string
+	activeLabel      string
+	discTotalBytes   int64
+	stage1TotalBytes int64
 }
 
 // NewWorker constructs a Worker with production defaults for /dev/sr0 and /scratch.
@@ -372,8 +443,10 @@ func NewWorker(scratchDir, devicePath string) *Worker {
 		MinISOSize:          MinISOSizeBytes,
 		SpaceWaitInterval:   DefaultSpaceWaitInterval,
 		Stage1RetryBackoffs: DefaultStage1RetryBackoffs,
+		EjectRetryBackoffs:  DefaultEjectRetryBackoffs,
 		RunCommand:          DefaultCommandRunner,
 		CheckSpace:          CheckScratchSpace,
+		QueryDiscSize:       QueryDiscCapacity,
 		QueryDriveStatus:    drive.QueryDriveStatus,
 		Now:                 time.Now,
 		Logger:              log.Default(),
@@ -394,12 +467,159 @@ func (w *Worker) setStatus(status string) {
 	w.mu.Unlock()
 }
 
+func (w *Worker) setActiveStage(status, stage string, stage1Total int64) {
+	w.mu.Lock()
+	w.status = status
+	w.activeStage = stage
+	if stage1Total > 0 {
+		w.stage1TotalBytes = stage1Total
+	}
+	w.mu.Unlock()
+}
+
+func (w *Worker) resetRipState() {
+	w.mu.Lock()
+	w.status = StatusIdle
+	w.activeJobDir = ""
+	w.activeStage = ""
+	w.activeLabel = ""
+	w.discTotalBytes = 0
+	w.stage1TotalBytes = 0
+	w.mu.Unlock()
+}
+
+// Progress computes live byte and percentage progress for the currently active rip job.
+func (w *Worker) Progress() Progress {
+	w.mu.RLock()
+	status := w.status
+	jobDir := w.activeJobDir
+	stage := w.activeStage
+	label := w.activeLabel
+	discTotal := w.discTotalBytes
+	stage1Total := w.stage1TotalBytes
+	w.mu.RUnlock()
+
+	if stage == "" {
+		switch status {
+		case StatusRippingStage1DVDBackup:
+			stage = Stage1DVDBackup
+		case StatusRippingStage1GenISO:
+			stage = Stage1GenISOImage
+		case StatusRippingStage2DDRescue:
+			stage = Stage2DDRescue
+		}
+	}
+	if stage == "" {
+		return Progress{Active: false}
+	}
+
+	var bytesDone, bytesTotal int64
+	switch stage {
+	case Stage1DVDBackup:
+		if jobDir != "" {
+			videoTSDir := filepath.Join(jobDir, "dvd", "VIDEO_TS")
+			bytesDone = directorySize(videoTSDir)
+			if bytesDone == 0 {
+				bytesDone = directorySize(filepath.Join(jobDir, "dvd"))
+			}
+		}
+		bytesTotal = discTotal
+
+	case Stage1GenISOImage:
+		if jobDir != "" {
+			bytesDone = regularFileSize(filepath.Join(jobDir, "disc.iso"))
+			if dvdBytes := directorySize(filepath.Join(jobDir, "dvd")); dvdBytes > 0 {
+				bytesTotal = dvdBytes
+			}
+		}
+		if bytesTotal <= 0 && stage1Total > 0 {
+			bytesTotal = stage1Total
+		}
+		if bytesTotal <= 0 {
+			bytesTotal = discTotal
+		}
+
+	case Stage2DDRescue:
+		bytesTotal = discTotal
+		if jobDir != "" {
+			mapPath := filepath.Join(jobDir, "ddrescue.map")
+			if f, err := os.Open(mapPath); err == nil {
+				rescued, mapTotal, _, parseErr := ParseDDRescueMap(f)
+				_ = f.Close()
+				if parseErr == nil {
+					bytesDone = int64(rescued)
+					if bytesTotal <= 0 && mapTotal > 0 {
+						bytesTotal = int64(mapTotal)
+					}
+				}
+			}
+			if bytesDone == 0 {
+				bytesDone = regularFileSize(filepath.Join(jobDir, "disc.iso"))
+			}
+		}
+	}
+
+	var pct float64
+	if bytesTotal > 0 && bytesDone > 0 {
+		pct = (float64(bytesDone) / float64(bytesTotal)) * 100.0
+		if pct > 100.0 {
+			pct = 100.0
+		}
+		if pct < 0.0 {
+			pct = 0.0
+		}
+	}
+
+	return Progress{
+		Active:     true,
+		Stage:      stage,
+		Label:      label,
+		BytesDone:  bytesDone,
+		BytesTotal: bytesTotal,
+		Percent:    pct,
+	}
+}
+
+func directorySize(dir string) int64 {
+	var total int64
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, infoErr := d.Info(); infoErr == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func regularFileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	return info.Size()
+}
+
+func (w *Worker) queryDiscSize(devicePath string) int64 {
+	fn := w.QueryDiscSize
+	if fn == nil {
+		fn = QueryDiscCapacity
+	}
+	size, err := fn(devicePath)
+	if err != nil || size < 0 {
+		return 0
+	}
+	return size
+}
+
 // RipDisc executes the full pre-rip capacity gate and two-stage DVD ISO ripping pipeline.
 func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 	if devicePath == "" {
 		devicePath = w.DevicePath
 	}
-	defer w.setStatus(StatusIdle)
+	defer w.resetRipState()
 
 	if err := os.MkdirAll(w.ScratchDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir scratch %s: %w", w.ScratchDir, err)
@@ -414,6 +634,9 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 		return nil, err
 	}
 
+	// Query optical disc total byte capacity for live Web UI progress reporting
+	discTotalBytes := w.queryDiscSize(devicePath)
+
 	// 2. Probe raw volume label (blkid primary, lsdvd -Ox <title> fallback) and track durations (lsdvd -Ox)
 	probeRes, probeErr := metadata.ProbeTarget(ctx, w.runCmd, w.dvdcssEnv(), devicePath)
 	rawLabel := ""
@@ -425,6 +648,10 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 		}
 	}
 	safeLabel := SanitizeVolumeID(rawLabel)
+	displayLabel := strings.TrimSpace(rawLabel)
+	if displayLabel == "" {
+		displayLabel = safeLabel
+	}
 
 	now := w.nowUTC()
 	jobID := fmt.Sprintf("job_%s", now.Format("20060102T150405Z"))
@@ -432,6 +659,13 @@ func (w *Worker) RipDisc(ctx context.Context, devicePath string) (*Job, error) {
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir job dir %s: %w", jobDir, err)
 	}
+
+	w.mu.Lock()
+	w.activeJobDir = jobDir
+	w.activeLabel = displayLabel
+	w.discTotalBytes = discTotalBytes
+	w.stage1TotalBytes = 0
+	w.mu.Unlock()
 
 	job := &Job{
 		JobID:         jobID,
@@ -565,7 +799,7 @@ func (w *Worker) runStage1(ctx context.Context, devicePath, safeLabel string, jo
 	// Step 1A: dvdbackup -M -r a -n dvd -i /dev/sr0 -o <job_dir>
 	job.Stage = Stage1DVDBackup
 	_ = WriteJobFile(job.JobDir, job)
-	w.setStatus(StatusRippingStage1DVDBackup)
+	w.setActiveStage(StatusRippingStage1DVDBackup, Stage1DVDBackup, 0)
 
 	env := w.dvdcssEnv()
 	dvdDir := filepath.Join(job.JobDir, "dvd")
@@ -606,7 +840,7 @@ func (w *Worker) runStage1(ctx context.Context, devicePath, safeLabel string, jo
 	// Step 1B: genisoimage -quiet -dvd-video -V <SAFE_LABEL_32> -o <job_dir>/disc.iso <job_dir>/dvd
 	job.Stage = Stage1GenISOImage
 	_ = WriteJobFile(job.JobDir, job)
-	w.setStatus(StatusRippingStage1GenISO)
+	w.setActiveStage(StatusRippingStage1GenISO, Stage1GenISOImage, directorySize(dvdDir))
 
 	out, err := w.runCmd(ctx, env, "genisoimage", "-quiet", "-dvd-video", "-V", safeLabel, "-o", job.ISOPath, dvdDir)
 	// Always delete <job_dir>/dvd once genisoimage finishes
@@ -651,7 +885,7 @@ func (w *Worker) sleep(ctx context.Context, d time.Duration) error {
 func (w *Worker) runStage2(ctx context.Context, devicePath string, job *Job) (float64, string, error) {
 	job.Stage = Stage2DDRescue
 	_ = WriteJobFile(job.JobDir, job)
-	w.setStatus(StatusRippingStage2DDRescue)
+	w.setActiveStage(StatusRippingStage2DDRescue, Stage2DDRescue, 0)
 
 	env := w.dvdcssEnv()
 
@@ -737,6 +971,13 @@ func (w *Worker) finalizeAndEject(ctx context.Context, devicePath string, job *J
 				_ = WriteJobFile(job.JobDir, job)
 			}
 		}
+		// If a delayed host udev event closed the tray while the local ISO re-probe was running,
+		// re-run eject so the tray remains open when the rip completes.
+		if status, _, statusErr := w.queryDriveStatusFn()(devicePath); statusErr == nil && status == drive.CDS_DISC_OK {
+			w.logf("[%s] Drive %s still reports %s after local ISO re-probe; re-ejecting",
+				job.JobID, devicePath, drive.DriveStatusString(status))
+			w.ejectBestEffort(ctx, devicePath)
+		}
 	}
 
 	if w.OnJobFinalized != nil {
@@ -777,9 +1018,45 @@ func (w *Worker) runCmd(ctx context.Context, env []string, name string, args ...
 	return runner(ctx, env, name, args...)
 }
 
+func (w *Worker) ejectBackoffs() []time.Duration {
+	if w.EjectRetryBackoffs != nil {
+		return w.EjectRetryBackoffs
+	}
+	return DefaultEjectRetryBackoffs
+}
+
 func (w *Worker) ejectBestEffort(ctx context.Context, devicePath string) {
-	if _, err := w.runCmd(ctx, nil, "eject", devicePath); err != nil {
-		w.logf("Warning: failed to eject %s: %v", devicePath, err)
+	backoffs := w.ejectBackoffs()
+	totalAttempts := len(backoffs) + 1
+	queryStatus := w.queryDriveStatusFn()
+
+	for attempt := 1; attempt <= totalAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := backoffs[attempt-2]
+			if err := w.sleep(ctx, backoff); err != nil {
+				return
+			}
+		}
+
+		drive.PrepareForEject(devicePath)
+		out, err := w.runCmd(ctx, nil, "eject", devicePath)
+		if err != nil {
+			w.logf("Warning: failed to eject %s (attempt %d/%d): %v (output: %s)",
+				devicePath, attempt, totalAttempts, err, tailString(out, 256))
+			continue
+		}
+
+		status, _, statusErr := queryStatus(devicePath)
+		if statusErr != nil || status == drive.CDS_NO_INFO {
+			return
+		}
+		if status == drive.CDS_TRAY_OPEN || status == drive.CDS_NO_DISC {
+			w.logf("Ejected %s (status=%s)", devicePath, drive.DriveStatusString(status))
+			return
+		}
+
+		w.logf("Warning: eject %s attempt %d/%d exited 0 but drive status is still %s (%d)",
+			devicePath, attempt, totalAttempts, drive.DriveStatusString(status), status)
 	}
 }
 

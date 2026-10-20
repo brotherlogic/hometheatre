@@ -14,8 +14,15 @@ import (
 
 const (
 	// ioctl request codes from <linux/cdrom.h>
-	CDROM_DRIVE_STATUS = 0x5326
-	CDROM_DISC_STATUS  = 0x5327
+	CDROM_SET_OPTIONS   = 0x5320
+	CDROM_CLEAR_OPTIONS = 0x5321
+	CDROM_DRIVE_STATUS  = 0x5326
+	CDROM_DISC_STATUS   = 0x5327
+	CDROM_LOCKDOOR      = 0x5329
+
+	// CD-ROM driver option flags from <linux/cdrom.h>
+	CDO_AUTO_CLOSE = 0x0001
+	CDO_LOCK       = 0x0008
 
 	// Slot selector
 	CDSL_CURRENT = 0
@@ -140,8 +147,24 @@ func ProbeFilesystemType(ctx context.Context, devicePath string) (string, error)
 	return strings.ToLower(strings.TrimSpace(string(out))), nil
 }
 
+// PrepareForEject opens devicePath with O_RDONLY|O_NONBLOCK, clears CDO_AUTO_CLOSE
+// (so concurrent host udev/blkid opens without O_NONBLOCK cannot automatically pull
+// an open motorized tray back in via CDROMCLOSETRAY), and unlocks the drive door
+// (CDROM_LOCKDOOR = 0). Errors are ignored as best-effort.
+func PrepareForEject(devicePath string) {
+	fd, err := unix.Open(devicePath, unix.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return
+	}
+	defer unix.Close(fd)
+
+	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(CDROM_CLEAR_OPTIONS), uintptr(CDO_AUTO_CLOSE))
+	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(CDROM_LOCKDOOR), 0)
+}
+
 // Eject runs `eject <devicePath>` to open the optical drive tray.
 func Eject(ctx context.Context, devicePath string) error {
+	PrepareForEject(devicePath)
 	out, err := exec.CommandContext(ctx, "eject", devicePath).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("eject %s failed: %w (output: %s)", devicePath, err, strings.TrimSpace(string(out)))

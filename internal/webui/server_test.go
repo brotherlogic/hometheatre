@@ -44,8 +44,9 @@ func (s *stubDrivePoller) set(code int) {
 }
 
 type stubRipperWorker struct {
-	mu     sync.RWMutex
-	status string
+	mu       sync.RWMutex
+	status   string
+	progress ripper.Progress
 }
 
 func (s *stubRipperWorker) Status() string {
@@ -54,10 +55,24 @@ func (s *stubRipperWorker) Status() string {
 	return s.status
 }
 
+func (s *stubRipperWorker) Progress() ripper.Progress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.progress
+}
+
 func (s *stubRipperWorker) set(st string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = st
+	s.progress = ripper.Progress{}
+}
+
+func (s *stubRipperWorker) setWithProgress(st string, prog ripper.Progress) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = st
+	s.progress = prog
 }
 
 func TestLiveDriveAndNFSQueueStatusAndRetryButton(t *testing.T) {
@@ -87,13 +102,14 @@ func TestLiveDriveAndNFSQueueStatusAndRetryButton(t *testing.T) {
 		driveCode   int
 		ripperState string
 		wantLabel   string
+		wantActive  bool
 	}{
-		{drive.CDS_NO_DISC, ripper.StatusIdle, "Empty"},
-		{drive.CDS_TRAY_OPEN, ripper.StatusIdle, "Tray Open"},
-		{drive.CDS_DRIVE_NOT_READY, ripper.StatusIdle, "Spinning Up / Reading TOC"},
-		{drive.CDS_DISC_OK, ripper.StatusWaitingForScratch, "Waiting for Scratch Space"},
-		{drive.CDS_DISC_OK, ripper.StatusRippingStage1DVDBackup, "Ripping Stage 1 (stage1_dvdbackup)"},
-		{drive.CDS_DISC_OK, ripper.StatusRippingStage2DDRescue, "Ripping Stage 2 (stage2_ddrescue)"},
+		{drive.CDS_NO_DISC, ripper.StatusIdle, "Empty", false},
+		{drive.CDS_TRAY_OPEN, ripper.StatusIdle, "Tray Open", false},
+		{drive.CDS_DRIVE_NOT_READY, ripper.StatusIdle, "Spinning Up / Reading TOC", false},
+		{drive.CDS_DISC_OK, ripper.StatusWaitingForScratch, "Waiting for Scratch Space", false},
+		{drive.CDS_DISC_OK, ripper.StatusRippingStage1DVDBackup, "Ripping Stage 1 (stage1_dvdbackup)", true},
+		{drive.CDS_DISC_OK, ripper.StatusRippingStage2DDRescue, "Ripping Stage 2 (stage2_ddrescue)", true},
 	}
 
 	for _, tc := range cases {
@@ -118,8 +134,47 @@ func TestLiveDriveAndNFSQueueStatusAndRetryButton(t *testing.T) {
 		if err := json.NewDecoder(apiRec.Body).Decode(&st); err != nil {
 			t.Fatal(err)
 		}
-		if st.CombinedDriveStatus != tc.wantLabel || st.PendingTransfers != 2 {
-			t.Fatalf("got status %+v, want CombinedDriveStatus=%q PendingTransfers=2", st, tc.wantLabel)
+		if st.CombinedDriveStatus != tc.wantLabel || st.PendingTransfers != 2 || st.RipActive != tc.wantActive {
+			t.Fatalf("got status %+v, want CombinedDriveStatus=%q PendingTransfers=2 RipActive=%v", st, tc.wantLabel, tc.wantActive)
+		}
+	}
+
+	// Verify live ripping progress bar and /api/status byte/percentage fields
+	const gib = 1024 * 1024 * 1024
+	poller.set(drive.CDS_DISC_OK)
+	ripWorker.setWithProgress(ripper.StatusRippingStage1DVDBackup, ripper.Progress{
+		Active:     true,
+		Stage:      ripper.Stage1DVDBackup,
+		Label:      "THE_MATRIX_16X9",
+		BytesDone:  2 * gib,
+		BytesTotal: 4 * gib,
+		Percent:    50.0,
+	})
+
+	progAPIReq := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	progAPIRec := httptest.NewRecorder()
+	srv.ServeHTTP(progAPIRec, progAPIReq)
+	var progSt StatusResponse
+	if err := json.NewDecoder(progAPIRec.Body).Decode(&progSt); err != nil {
+		t.Fatal(err)
+	}
+	if !progSt.RipActive || progSt.RipProgressPct != 50.0 || progSt.RipBytesDone != 2*gib || progSt.RipBytesTotal != 4*gib || progSt.RipLabel != "THE_MATRIX_16X9" {
+		t.Fatalf("unexpected progress in /api/status: %+v", progSt)
+	}
+
+	progHTMLReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	progHTMLRec := httptest.NewRecorder()
+	srv.ServeHTTP(progHTMLRec, progHTMLReq)
+	progHTML := progHTMLRec.Body.String()
+	for _, wantSnippet := range []string{
+		`id="rip-progress-container"`,
+		`THE_MATRIX_16X9`,
+		`50.0% (2.00 GiB / 4.00 GiB)`,
+		`width: 50.0%;`,
+		`setInterval(pollStatus, 2000)`,
+	} {
+		if !strings.Contains(progHTML, wantSnippet) {
+			t.Fatalf("expected dashboard HTML to contain %q, got:\n%s", wantSnippet, progHTML)
 		}
 	}
 

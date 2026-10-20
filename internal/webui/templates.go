@@ -157,6 +157,32 @@ const dashboardTemplateHTML = `<!DOCTYPE html>
       margin: 0;
     }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.85rem; }
+    .progress-container {
+      margin-top: 12px;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+      gap: 8px;
+    }
+    .progress-track {
+      width: 100%;
+      height: 10px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--success));
+      border-radius: 999px;
+      transition: width 0.3s ease;
+    }
   </style>
 </head>
 <body>
@@ -183,27 +209,36 @@ const dashboardTemplateHTML = `<!DOCTYPE html>
       <div class="card status-card">
         <div class="status-label">Optical Drive &amp; Ripper State</div>
         <div class="status-value" id="live-drive-status">{{.Status.CombinedDriveStatus}}</div>
-        <div class="status-sub">Drive: <span class="mono">{{.Status.DriveStatus}}</span> | Pipeline: <span class="mono">{{.Status.RipperStatus}}</span></div>
+        <div class="status-sub">Drive: <span class="mono" id="live-drive-raw">{{.Status.DriveStatus}}</span> | Pipeline: <span class="mono" id="live-ripper-raw">{{.Status.RipperStatus}}</span></div>
+        <div class="progress-container" id="rip-progress-container" style="{{if not .Status.RipActive}}display:none;{{end}}">
+          <div class="progress-header">
+            <span class="mono" id="rip-progress-label">{{.Status.RipLabel}}</span>
+            <span class="mono" id="rip-progress-text">{{printf "%.1f%%" .Status.RipProgressPct}} ({{formatGiB .Status.RipBytesDone}} / {{formatGiB .Status.RipBytesTotal}})</span>
+          </div>
+          <div class="progress-track" id="rip-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{printf "%.1f" .Status.RipProgressPct}}">
+            <div class="progress-fill" id="rip-progress-bar" style="width: {{printf "%.1f%%" .Status.RipProgressPct}};"></div>
+          </div>
+        </div>
       </div>
 
       <div class="card status-card">
         <div class="status-label">Background NFS Transfer Queue</div>
         <div class="status-value" id="live-nfs-status">{{.Status.NFSStatus}}</div>
-        <div class="status-sub">Queued Transfers: <span class="mono">{{.Status.PendingTransfers}}</span></div>
+        <div class="status-sub">Queued Transfers: <span class="mono" id="live-pending-transfers">{{.Status.PendingTransfers}}</span></div>
         {{if .Status.NFSRetryPending}}
           <form method="POST" action="/retry-transfer" style="margin-top:10px;">
-            <button type="submit" class="btn btn-warn">Retry Transfer Now</button>
+            <button type="submit" id="retry-transfer-btn" class="btn btn-warn">Retry Transfer Now</button>
           </form>
         {{else}}
           <form method="POST" action="/retry-transfer" style="margin-top:10px;">
-            <button type="submit" class="btn btn-secondary">Retry Transfer Now</button>
+            <button type="submit" id="retry-transfer-btn" class="btn btn-secondary">Retry Transfer Now</button>
           </form>
         {{end}}
       </div>
 
       <div class="card status-card">
         <div class="status-label">Unidentified / Needs Tagging Queue</div>
-        <div class="status-value">{{.Status.UnidentifiedCount}} Disc(s)</div>
+        <div class="status-value" id="live-unidentified-count">{{.Status.UnidentifiedCount}} Disc(s)</div>
         <div class="status-sub">Backed statelessly by <span class="mono">/mnt/nfs/unidentified/*.probe.json</span></div>
       </div>
     </div>
@@ -500,6 +535,72 @@ const dashboardTemplateHTML = `<!DOCTYPE html>
           container.innerHTML = '<div class="subtitle">Search error: ' + err + '</div>';
         });
     }
+
+    function formatGiB(bytes) {
+      var gib = 1024 * 1024 * 1024;
+      var val = (bytes && bytes > 0) ? (bytes / gib) : 0;
+      return val.toFixed(2) + ' GiB';
+    }
+
+    function pollStatus() {
+      fetch('/api/status')
+        .then(function(r) { return r.json(); })
+        .then(function(st) {
+          var driveEl = document.getElementById('live-drive-status');
+          if (driveEl && st.combined_drive_status) {
+            driveEl.textContent = st.combined_drive_status;
+          }
+          var driveRawEl = document.getElementById('live-drive-raw');
+          if (driveRawEl && st.drive_status) {
+            driveRawEl.textContent = st.drive_status;
+          }
+          var ripperRawEl = document.getElementById('live-ripper-raw');
+          if (ripperRawEl && st.ripper_status) {
+            ripperRawEl.textContent = st.ripper_status;
+          }
+          var progContainer = document.getElementById('rip-progress-container');
+          if (progContainer) {
+            progContainer.style.display = st.rip_active ? '' : 'none';
+          }
+          var pct = (typeof st.rip_progress_pct === 'number' && st.rip_progress_pct > 0) ? st.rip_progress_pct : 0;
+          if (pct > 100) pct = 100;
+          var progLabel = document.getElementById('rip-progress-label');
+          if (progLabel) {
+            progLabel.textContent = st.rip_label || '';
+          }
+          var progText = document.getElementById('rip-progress-text');
+          if (progText) {
+            progText.textContent = pct.toFixed(1) + '% (' + formatGiB(st.rip_bytes_done) + ' / ' + formatGiB(st.rip_bytes_total) + ')';
+          }
+          var progBar = document.getElementById('rip-progress-bar');
+          if (progBar) {
+            progBar.style.width = pct.toFixed(1) + '%';
+          }
+          var progTrack = document.getElementById('rip-progress-track');
+          if (progTrack) {
+            progTrack.setAttribute('aria-valuenow', pct.toFixed(1));
+          }
+          var nfsEl = document.getElementById('live-nfs-status');
+          if (nfsEl && st.nfs_status) {
+            nfsEl.textContent = st.nfs_status;
+          }
+          var pendingEl = document.getElementById('live-pending-transfers');
+          if (pendingEl && typeof st.pending_transfers === 'number') {
+            pendingEl.textContent = String(st.pending_transfers);
+          }
+          var retryBtn = document.getElementById('retry-transfer-btn');
+          if (retryBtn) {
+            retryBtn.className = st.nfs_retry_pending ? 'btn btn-warn' : 'btn btn-secondary';
+          }
+          var unidEl = document.getElementById('live-unidentified-count');
+          if (unidEl && typeof st.unidentified_count === 'number') {
+            unidEl.textContent = st.unidentified_count + ' Disc(s)';
+          }
+        })
+        .catch(function() {});
+    }
+
+    setInterval(pollStatus, 2000);
   </script>
 </body>
 </html>

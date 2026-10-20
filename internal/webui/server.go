@@ -32,17 +32,23 @@ type RipperStatusProvider interface {
 	Status() string
 }
 
+// RipperProgressProvider is an optional extension implemented by ripper.Worker
+// to expose live byte and percentage progress while a rip is active.
+type RipperProgressProvider interface {
+	Progress() ripper.Progress
+}
+
 // Server serves the embedded Go Web UI (net/http + html/template) and JSON action endpoints.
 type Server struct {
-	Poller             DriveStatusProvider
-	Ripper             RipperStatusProvider
-	NFSWriter          *nfs.Writer
-	TMDB               *metadata.TMDBClient
-	History            *history.Store
-	Logs               *history.LogBuffer
-	Webhook            *webhook.Notifier
-	QueueCountFunc     func() int
-	Logger             *log.Logger
+	Poller         DriveStatusProvider
+	Ripper         RipperStatusProvider
+	NFSWriter      *nfs.Writer
+	TMDB           *metadata.TMDBClient
+	History        *history.Store
+	Logs           *history.LogBuffer
+	Webhook        *webhook.Notifier
+	QueueCountFunc func() int
+	Logger         *log.Logger
 
 	tmpl *template.Template
 	mux  *http.ServeMux
@@ -68,19 +74,24 @@ type UnidentifiedView struct {
 
 // StatusResponse represents the JSON payload returned by GET /api/status.
 type StatusResponse struct {
-	DriveStatus         string `json:"drive_status"`
-	RipperStatus        string `json:"ripper_status"`
-	CombinedDriveStatus string `json:"combined_drive_status"`
-	NFSStatus           string `json:"nfs_status"`
-	NFSRetryPending     bool   `json:"nfs_retry_pending"`
-	PendingTransfers    int    `json:"pending_transfers"`
-	UnidentifiedCount   int    `json:"unidentified_count"`
+	DriveStatus         string  `json:"drive_status"`
+	RipperStatus        string  `json:"ripper_status"`
+	CombinedDriveStatus string  `json:"combined_drive_status"`
+	RipActive           bool    `json:"rip_active"`
+	RipProgressPct      float64 `json:"rip_progress_pct"`
+	RipBytesDone        int64   `json:"rip_bytes_done"`
+	RipBytesTotal       int64   `json:"rip_bytes_total"`
+	RipLabel            string  `json:"rip_label"`
+	NFSStatus           string  `json:"nfs_status"`
+	NFSRetryPending     bool    `json:"nfs_retry_pending"`
+	PendingTransfers    int     `json:"pending_transfers"`
+	UnidentifiedCount   int     `json:"unidentified_count"`
 }
 
 // TagRequest represents a form or JSON request to confirm/tag or delete an item in /unidentified.
 type TagRequest struct {
 	ISOFilename   string `json:"iso_filename"`
-	Action        string `json:"action"` // "tag" (default), "replace", or "delete"
+	Action        string `json:"action"`     // "tag" (default), "replace", or "delete"
 	MediaType     string `json:"media_type"` // "movie" or "tv"
 	TMDBID        int    `json:"tmdb_id"`
 	Title         string `json:"title"`
@@ -106,6 +117,7 @@ func NewServer(
 		"mulPct": func(v float64) float64 {
 			return v * 100.0
 		},
+		"formatGiB": formatGiBSize,
 	}
 	s := &Server{
 		Poller:    poller,
@@ -121,6 +133,14 @@ func NewServer(
 	}
 	s.registerRoutes()
 	return s
+}
+
+func formatGiBSize(bytes int64) string {
+	const gib = 1024.0 * 1024.0 * 1024.0
+	if bytes < 0 {
+		bytes = 0
+	}
+	return fmt.Sprintf("%.2f GiB", float64(bytes)/gib)
 }
 
 // ServeHTTP implements http.Handler.
@@ -157,18 +177,36 @@ func (s *Server) CurrentStatus() StatusResponse {
 	}
 
 	combined := driveLabel
+	ripActive := false
 	switch ripperLabel {
 	case ripper.StatusWaitingForScratch:
 		combined = "Waiting for Scratch Space"
 	case ripper.StatusRippingStage1DVDBackup:
 		combined = "Ripping Stage 1 (stage1_dvdbackup)"
+		ripActive = true
 	case ripper.StatusRippingStage1GenISO:
 		combined = "Ripping Stage 1 (stage1_genisoimage)"
+		ripActive = true
 	case ripper.StatusRippingStage2DDRescue:
 		combined = "Ripping Stage 2 (stage2_ddrescue)"
+		ripActive = true
 	default:
 		if ripperLabel != "" && ripperLabel != ripper.StatusIdle {
 			combined = ripperLabel
+		}
+	}
+
+	var ripProgressPct float64
+	var ripBytesDone, ripBytesTotal int64
+	var ripLabel string
+	if pp, ok := s.Ripper.(RipperProgressProvider); ok {
+		prog := pp.Progress()
+		if prog.Active {
+			ripActive = true
+			ripProgressPct = prog.Percent
+			ripBytesDone = prog.BytesDone
+			ripBytesTotal = prog.BytesTotal
+			ripLabel = prog.Label
 		}
 	}
 
@@ -193,6 +231,11 @@ func (s *Server) CurrentStatus() StatusResponse {
 		DriveStatus:         driveLabel,
 		RipperStatus:        ripperLabel,
 		CombinedDriveStatus: combined,
+		RipActive:           ripActive,
+		RipProgressPct:      ripProgressPct,
+		RipBytesDone:        ripBytesDone,
+		RipBytesTotal:       ripBytesTotal,
+		RipLabel:            ripLabel,
 		NFSStatus:           nfsLabel,
 		NFSRetryPending:     nfsLabel == nfs.StatusNFSTransferPendingRetry,
 		PendingTransfers:    pending,
