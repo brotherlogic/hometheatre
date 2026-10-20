@@ -741,6 +741,10 @@ deploy_devpod_daemon() {
     # Ensure background supervisor is started even if the provider skipped postStartCommand
     run_devpod ssh "$DAEMON_WORKSPACE_ID" --command "/usr/local/bin/start-daemon.sh" >/dev/null 2>&1 || true
 
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && -d "${SCRIPT_DIR}/.git" ]]; then
+        chown -R "${SUDO_USER}:${SUDO_GID:-$(id -g "$SUDO_USER")}" "${SCRIPT_DIR}/.git" 2>/dev/null || true
+    fi
+
     log_ok "Home Theatre DevPod daemon container '${DAEMON_WORKSPACE_ID}' is up and running."
 }
 
